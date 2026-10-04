@@ -1,5 +1,71 @@
 # Changelog
 
+## [1.2.0] — 2026-10-05 — DOMAIN-AWARE ACCOUNT POLICY
+
+### The problem
+
+On a domain-joined member server, the Account Policies rows (CIS 1.1.x / 1.2.x
+and the nine STIG equivalents — 19 checks in all) read the **local** security
+policy. That governs local SAM accounts only. Domain accounts are governed by
+the Default Domain Policy held at the DC, which WinGuard never looked at.
+
+A member server whose password rules are set purely at the domain level —
+the normal arrangement — therefore failed CIS 1.1.4 "minimum password length"
+while every account anyone actually logs in with was properly governed at 14+.
+The finding was not wrong, but it said nothing about the half of the picture
+that mattered, and there was no way to tell it apart from a host where nothing
+enforced the rule at all.
+
+### Fixed
+
+- **Domain membership is now detected** (`Win32_ComputerSystem.PartOfDomain`).
+  `ProductType` alone cannot distinguish a domain member from a standalone
+  server, and that distinction is what decides whether the local account policy
+  is the whole story. The detected domain is recorded in the reports, and the
+  role now reads "Domain Member Server" or "Standalone Server" rather than
+  lumping the two together.
+
+- **`-IncludeDomainPolicy` now reconciles the two.** When it is passed (or on a
+  domain controller, where the data is local) the Default Domain Password Policy
+  is fetched once during preflight and every Account Policies row is evaluated
+  against both:
+
+  | Local | Domain | Result |
+  |---|---|---|
+  | meets | — | PASS |
+  | fails | meets | **WARN**, explaining that domain accounts are covered and this value governs local SAM accounts only |
+  | fails | fails | **FAIL**, stating that neither covers it |
+
+  Deliberately not a PASS: the local value still governs the built-in
+  Administrator and any local service account on that host, which is exactly
+  what CIS is asking about. A local account created there would be held to the
+  weaker rule. The point is to separate "covered elsewhere" from "not covered at
+  all", not to make the finding disappear.
+
+  Verified against a simulated member server with weak local and strong domain
+  policy: 5 findings move FAIL → WARN; with a weak domain policy the same 5 stay
+  FAIL; on a standalone host the reconciliation is inert.
+
+- **The switch is now discoverable.** A domain-joined host with failing Account
+  Policies checks that did *not* pass `-IncludeDomainPolicy` gets told, at the
+  end of the run, that it is seeing half the picture and what to re-run. Silently
+  producing misleading failures was the real bug.
+
+- **RSAT is no longer required.** If the `ActiveDirectory` module is absent the
+  policy is read from `net accounts /domain`, parsed by line position rather
+  than by English labels so it survives a localised Windows.
+
+### New checks
+
+- `HRD-AUTH-19` — **fine-grained password policies (PSOs)**, which silently
+  override the default domain policy for the users and groups they apply to. A
+  domain can show 14 characters at the default while a PSO holds an admin group
+  to 8. Flags any PSO below a 14-character minimum.
+- `HRD-AUTH-20` — **Group Policy objects applied to this computer**, read from
+  the local GPO history. When a benchmark row fails, the next question is always
+  "what is meant to be setting this?", and this makes that answerable from the
+  report rather than a separate `gpresult` run.
+
 ## [1.1.2] — 2026-10-05 — FIX: reports silently written nowhere on UNC / redirected drives
 
 ### Fixed

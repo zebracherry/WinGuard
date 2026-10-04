@@ -135,13 +135,40 @@ case-insensitive, so `-B` would collide with `-b`; `-Bu` works.
 .\winguard.ps1 -IncludeDomainPolicy
 ```
 
-### A note on `-IncludeDomainPolicy`
+### Auditing a domain-joined server: use `-IncludeDomainPolicy`
 
-The account-policy rows in the CIS and STIG sections read the **local** security
-policy. On a domain-joined server that is *not* the policy governing domain
-accounts — the Default Domain Policy at the DC is. `-IncludeDomainPolicy` audits
-that too (minimum length, complexity, reversible encryption, lockout threshold
-and duration).
+The Account Policies rows (CIS 1.1.x / 1.2.x and the STIG equivalents — 19
+checks) read the **local** security policy, which governs local SAM accounts
+only. On a domain member, domain accounts are governed by the Default Domain
+Policy at the DC.
+
+So a member server with password rules set purely at the domain level — the
+normal arrangement — fails CIS 1.1.4 "minimum password length" locally while
+every account anyone logs in with is properly governed at 14+.
+
+`-IncludeDomainPolicy` fetches the domain policy and evaluates both:
+
+| Local | Domain | Result |
+|---|---|---|
+| meets | — | **PASS** |
+| fails | meets | **WARN** — domain accounts are covered; this value governs local SAM accounts only |
+| fails | fails | **FAIL** — neither covers it |
+
+It is deliberately **not** a PASS. The local value still governs the built-in
+Administrator and any local service account on that host, which is what CIS is
+asking about. The switch separates "covered elsewhere" from "not covered at
+all" — it does not make the finding go away.
+
+If you are on a domain member and Account Policies checks fail without the
+switch, the run tells you so at the end rather than letting you act on half a
+picture. On a domain controller it runs automatically, because there the data
+is local. RSAT is preferred but not required — without it the policy is read
+from `net accounts /domain`.
+
+Two related checks come with it: `HRD-AUTH-19` reports fine-grained password
+policies (PSOs), which silently override the domain default for the groups they
+apply to, and `HRD-AUTH-20` lists the GPOs applied to the computer, so a failing
+row can be traced to what was meant to set it.
 
 It is off by default because it is the only check in the tool that leaves the
 host: it makes one LDAP query to this machine's own domain controller. On a

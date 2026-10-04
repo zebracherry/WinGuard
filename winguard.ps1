@@ -72,7 +72,7 @@
     bundle for transfer, and fail the pipeline if anything is still open.
 
 .NOTES
-    Version : 1.1.2
+    Version : 1.2.0
     Covers  : Windows Server 2016, 2019, 2022, 2025 (auto-detected; 2012/2012 R2
               best-effort, Windows 10/11 best-effort)
     Sources : CIS Microsoft Windows Server Benchmarks (2016 v3.0.0, 2019 v3.0.0,
@@ -150,7 +150,7 @@ $WarningPreference     = 'SilentlyContinue'
 # GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 $script:ToolName    = 'WinGuard'
-$script:ToolVersion = '1.1.2'
+$script:ToolVersion = '1.2.0'
 $script:ToolEngine  = 'powershell'
 
 $script:StartTime  = Get-Date
@@ -183,6 +183,11 @@ $script:IsDC        = $false
 $script:IsAdmin     = $false
 $script:HostName    = $env:COMPUTERNAME
 $script:DomainRole  = 'Unknown'
+$script:IsDomainJoined = $false
+$script:DomainName     = ''
+$script:DomainPolicy   = $null   # Default Domain Password Policy, when fetched
+$script:DomainPolTried = $false
+$script:AcctPolicyDeferred = 0   # local account-policy checks the domain covers
 
 # Caches - populated lazily, each at most once per run
 $script:ReportWriteFailed = $false
@@ -330,11 +335,20 @@ function Get-WgPlatform {
         elseif ($script:OsBuild -ge 19041) { $script:OsToken = '2019' }
     }
 
+    # Domain membership. ProductType alone cannot tell a domain-joined member
+    # server from a standalone one, and that distinction decides whether the
+    # local account policy is the whole story or only half of it.
+    $cs = Get-WgWmi -Class Win32_ComputerSystem
+    if ($cs) {
+        $script:IsDomainJoined = [bool] $cs.PartOfDomain
+        if ($script:IsDomainJoined) { $script:DomainName = "$($cs.Domain)" }
+    }
+
     $script:OsRole = if ($script:IsDC) { 'DC' } else { 'MS' }
     $script:DomainRole = switch ("$($os.ProductType)") {
-        '1' { 'Workstation' }
+        '1' { if ($script:IsDomainJoined) { 'Domain-joined Workstation' } else { 'Workgroup Workstation' } }
         '2' { 'Domain Controller' }
-        '3' { 'Member / Standalone Server' }
+        '3' { if ($script:IsDomainJoined) { 'Domain Member Server' } else { 'Standalone Server' } }
         default { 'Unknown' }
     }
 
@@ -966,6 +980,127 @@ function Get-WgAsrRules {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# DOMAIN PASSWORD POLICY
+#
+# On a domain member the local security policy read by the Account Policies
+# benchmark rows governs the LOCAL SAM accounts only. Domain accounts are
+# governed by the Default Domain Policy held at the DC. A member server whose
+# password rules are set purely at the domain level therefore fails CIS 1.1.x
+# locally while every account anyone actually logs in with is properly
+# governed - and the report gives no hint of that.
+#
+# Fetching it is the one thing in this tool that talks to the network, so it is
+# gated behind -IncludeDomainPolicy and runs automatically only on a DC, where
+# the data is local.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Benchmark token -> how to read it off the AD policy object, normalised to the
+# same units and representation that secedit uses locally.
+function Get-WgDomainPolicy {
+    if ($script:DomainPolTried) { return $script:DomainPolicy }
+    $script:DomainPolTried = $true
+    if (-not ($script:IsDC -or $script:IncludeDomainPol)) { return $null }
+    if (-not $script:IsDomainJoined -and -not $script:IsDC) { return $null }
+
+    $pol = $null
+    try {
+        if (Get-Command Get-ADDefaultDomainPasswordPolicy -ErrorAction SilentlyContinue) {
+            $pol = Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop
+        }
+    } catch { $pol = $null }
+
+    # Fall back to `net accounts /domain`, which needs no RSAT. It is parsed
+    # loosely on purpose: the output is localised, so values are taken by
+    # position on the line rather than by matching English labels.
+    if (-not $pol) {
+        try {
+            $raw = & net.exe accounts /domain 2>$null
+            if ($raw) {
+                $vals = @{}
+                $i = 0
+                foreach ($line in $raw) {
+                    $t = "$line".Trim()
+                    if ($t -notmatch ':') { continue }
+                    $v = ($t -split ':', 2)[1].Trim()
+                    $i++
+                    $vals[$i] = $v
+                }
+                # Order is stable across releases: min age, max age, min length,
+                # history, lockout threshold, lockout duration, lockout window.
+                if ($vals.Count -ge 7) {
+                    $num = { param($x) $n = 0; if ([int]::TryParse(("$x" -split '\s+')[0], [ref] $n)) { $n } else { $null } }
+                    $script:DomainPolicy = @{
+                        MinimumPasswordAge    = (& $num $vals[1])
+                        MaximumPasswordAge    = (& $num $vals[2])
+                        MinimumPasswordLength = (& $num $vals[3])
+                        PasswordHistorySize   = (& $num $vals[4])
+                        LockoutBadCount       = (& $num $vals[5])
+                        LockoutDuration       = (& $num $vals[6])
+                        ResetLockoutCount     = (& $num $vals[7])
+                        Source                = 'net accounts /domain'
+                    }
+                }
+            }
+        } catch { }
+        return $script:DomainPolicy
+    }
+
+    $script:DomainPolicy = @{
+        PasswordHistorySize   = [int] $pol.PasswordHistoryCount
+        MaximumPasswordAge    = [int] $pol.MaxPasswordAge.TotalDays
+        MinimumPasswordAge    = [int] $pol.MinPasswordAge.TotalDays
+        MinimumPasswordLength = [int] $pol.MinPasswordLength
+        PasswordComplexity    = $(if ($pol.ComplexityEnabled) { 1 } else { 0 })
+        ClearTextPassword     = $(if ($pol.ReversibleEncryptionEnabled) { 1 } else { 0 })
+        LockoutBadCount       = [int] $pol.LockoutThreshold
+        LockoutDuration       = [int] $pol.LockoutDuration.TotalMinutes
+        ResetLockoutCount     = [int] $pol.LockoutObservationWindow.TotalMinutes
+        Source                = 'Default Domain Password Policy'
+        Raw                   = $pol
+    }
+    return $script:DomainPolicy
+}
+
+# The settings that exist in both places. Anything not listed here has a single
+# source of truth, so there is nothing to reconcile.
+$script:DomainGovernedTokens = @{
+    'passwordhistorysize'                    = 'PasswordHistorySize'
+    'maximumpasswordage'                     = 'MaximumPasswordAge'
+    'minimumpasswordage'                     = 'MinimumPasswordAge'
+    'minimumpasswordlength'                  = 'MinimumPasswordLength'
+    'passwordcomplexity'                     = 'PasswordComplexity'
+    'cleartextpassword'                      = 'ClearTextPassword'
+    'lockoutbadcount'                        = 'LockoutBadCount'
+    'lockoutduration'                        = 'LockoutDuration'
+    'resetlockoutcount'                      = 'ResetLockoutCount'
+    'system access\passwordcomplexity'       = 'PasswordComplexity'
+    'system access\cleartextpassword'        = 'ClearTextPassword'
+    'system access\minimumpasswordlength'    = 'MinimumPasswordLength'
+    'system access\maximumpasswordage'       = 'MaximumPasswordAge'
+    'system access\minimumpasswordage'       = 'MinimumPasswordAge'
+    'system access\passwordhistorysize'      = 'PasswordHistorySize'
+    'system access\lockoutbadcount'          = 'LockoutBadCount'
+    'system access\lockoutduration'          = 'LockoutDuration'
+    'system access\resetlockoutcount'        = 'ResetLockoutCount'
+}
+
+function Get-WgDomainGoverned {
+    <# -> the domain's value for a benchmark target, or $null if this setting
+       is not one the domain also governs (or the policy was not fetched). #>
+    param([string] $Method, [string] $Target)
+    if ($Method -ne 'accountpolicy' -and $Method -ne 'secedit') { return $null }
+    if (-not $script:IsDomainJoined -and -not $script:IsDC) { return $null }
+    $dp = Get-WgDomainPolicy
+    if (-not $dp) { return $null }
+    $key = "$Target".ToLower()
+    if (-not $script:DomainGovernedTokens.ContainsKey($key)) { return $null }
+    $prop = $script:DomainGovernedTokens[$key]
+    if (-not $dp.ContainsKey($prop)) { return $null }
+    return $dp[$prop]
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PER-USER POLICY HIVES
 # A few STIG rules target HKEY_CURRENT_USER. Reading HKCU would only describe
 # whichever profile happens to be running the scan, which is not what the rule
@@ -1317,6 +1452,41 @@ function Invoke-WgTable {
 
         $ok = Test-WgCompare -Operator $op -Actual $actual -Expected $exp
         $shown = if ($null -eq $actual) { '(absent)' } elseif ("$actual" -eq '') { '(empty)' } else { "$actual" }
+
+        # ── Domain context ──────────────────────────────────────────────────
+        # A local account-policy setting that fails here may still be enforced
+        # for every account people actually use, because the Default Domain
+        # Policy governs domain accounts. That is not a pass - the local value
+        # still governs local SAM accounts, which is what CIS is asking about -
+        # but it is a materially different finding from "nothing enforces this",
+        # so it is reported as a warning that says which is which.
+        if (-not $ok) {
+            $domainVal = Get-WgDomainGoverned -Method $method -Target $target
+            if ($null -ne $domainVal) {
+                $domainOk = Test-WgCompare -Operator $op -Actual $domainVal -Expected $exp
+                $dp = Get-WgDomainPolicy
+                $src = if ($dp -and $dp.Source) { $dp.Source } else { 'the domain policy' }
+                if ($domainOk) {
+                    $script:AcctPolicyDeferred++
+                    Add-WgResult -Status 'WARN' -Id $id -Title $title -Category $category `
+                        -Framework $Framework -Severity $severity -Refs $refText -Remediation $rem `
+                        -Description ("The LOCAL policy on this host is $shown, which does not meet " +
+                                      "$expText - but $src sets it to '$domainVal', which does. " +
+                                      'Domain accounts are therefore covered; this local value governs ' +
+                                      'only the local SAM accounts on this server, such as the built-in ' +
+                                      'Administrator and any local service accounts. CIS still asks for ' +
+                                      'it to be set locally, because a local account created here would ' +
+                                      'otherwise be held to the weaker rule.')
+                    continue
+                }
+                Add-WgResult -Status $badStatus -Id $id -Title $title -Category $category `
+                    -Framework $Framework -Severity $severity -Refs $refText -Remediation $rem `
+                    -Description ("$source is $shown; expected $expText. $src does not cover this " +
+                                  "either - it sets '$domainVal' - so neither local nor domain " +
+                                  'accounts are held to the benchmark here.')
+                continue
+            }
+        }
 
         Add-WgResult -Status $(if ($ok) { 'PASS' } else { $badStatus }) -Id $id -Title $title `
             -Category $category -Framework $Framework -Severity $severity -Refs $refText `
@@ -4643,16 +4813,20 @@ function Invoke-WgExtraChecks {
             'https://learn.microsoft.com/en-us/entra/identity/authentication/concept-password-ban-bad'
         )
 
-        $pol = $null
+        # Reuse the copy fetched during preflight, so the benchmark rows and this
+        # check cannot disagree and the DC is queried once per run.
+        $dp  = Get-WgDomainPolicy
+        $pol = if ($dp -and $dp.Raw) { $dp.Raw } else { $null }
         $why = ''
-        try {
-            if (Get-Command Get-ADDefaultDomainPasswordPolicy -ErrorAction SilentlyContinue) {
-                $pol = Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop
-            } else {
+        if (-not $pol) {
+            if (-not (Get-Command Get-ADDefaultDomainPasswordPolicy -ErrorAction SilentlyContinue)) {
                 $why = 'the ActiveDirectory module (RSAT) is not installed'
+                if ($dp) {
+                    $why += ", though '$($dp.Source)' supplied the numeric values used elsewhere in this report"
+                }
+            } else {
+                $why = 'the query to the domain controller did not return a policy'
             }
-        } catch {
-            $why = "the query failed: $($_.Exception.Message)"
         }
 
         if (-not $pol) {
@@ -4720,6 +4894,76 @@ function Invoke-WgExtraChecks {
                               'users or groups - check Get-ADFineGrainedPasswordPolicy as well.')
         }
     }
+
+    # ── Policy source visibility ─────────────────────────────────────────────
+    # When a benchmark row fails, the next question is always "what is setting
+    # this?". These two make that answerable from the report itself.
+    if ($script:IsDomainJoined -or $script:IsDC) {
+        Write-WgBanner 'POSTURE - AUTH: policy source (GPO / fine-grained policy)' @(
+            'https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/get-started/adac/introduction-to-active-directory-administrative-center-enhancements--level-100-#fine_grained_pswd_policy_mgmt'
+        )
+
+        # Fine-grained password policies silently override the default domain
+        # policy for the users or groups they are applied to.
+        if (Get-Command Get-ADFineGrainedPasswordPolicy -ErrorAction SilentlyContinue) {
+            $psos = $null
+            try { $psos = @(Get-ADFineGrainedPasswordPolicy -Filter * -ErrorAction Stop) } catch { $psos = $null }
+            if ($null -eq $psos) {
+                Add-WgResult -Status 'SKIP' -Id 'HRD-AUTH-19' -Title 'Fine-grained password policies' `
+                    -Category 'AUTH' -Severity 'Medium' `
+                    -Description 'Fine-grained password policies could not be enumerated from this host.'
+            } elseif ($psos.Count -eq 0) {
+                Add-WgResult -Status 'PASS' -Id 'HRD-AUTH-19' -Title 'Fine-grained password policies' `
+                    -Category 'AUTH' -Severity 'Medium' `
+                    -Description ('No fine-grained password policies exist, so the Default Domain ' +
+                                  'Policy is the whole picture for domain accounts.')
+            } else {
+                $weak = @($psos | Where-Object { [int] $_.MinPasswordLength -lt 14 })
+                Add-WgResult -Status $(if ($weak.Count -gt 0) { 'WARN' } else { 'INFO' }) `
+                    -Id 'HRD-AUTH-19' -Title 'Fine-grained password policies' -Category 'AUTH' `
+                    -Severity 'Medium' `
+                    -Description ("$($psos.Count) fine-grained password polic(y/ies) exist and override " +
+                                  'the default for the users and groups they apply to: ' +
+                                  ((@($psos) | Select-Object -First 6 | ForEach-Object {
+                                      "$($_.Name) (min length $($_.MinPasswordLength), precedence $($_.Precedence))" }) -join '; ') +
+                                  '.' + $(if ($weak.Count -gt 0) {
+                                      " $($weak.Count) of them set a minimum length below 14, so some accounts are held to a weaker rule than the domain default suggests."
+                                    } else { '' })) `
+                    -Remediation $(if ($weak.Count -gt 0) {
+                        'Review each PSO: Get-ADFineGrainedPasswordPolicy -Filter * | Select Name,Precedence,MinPasswordLength,AppliesTo' } else { '' })
+            }
+        }
+
+        # Which GPOs actually reached this computer.
+        $gpoNames = @()
+        try {
+            $histRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\History'
+            foreach ($ext in @(Get-ChildItem -LiteralPath $histRoot -ErrorAction Stop)) {
+                foreach ($g in @(Get-ChildItem -LiteralPath $ext.PSPath -ErrorAction SilentlyContinue)) {
+                    $dn = Get-WgRegValue $g.PSPath 'DisplayName'
+                    if ($dn) { $gpoNames += "$dn" }
+                }
+            }
+        } catch { }
+        $gpoNames = @($gpoNames | Sort-Object -Unique)
+
+        if ($gpoNames.Count -gt 0) {
+            Add-WgResult -Status 'INFO' -Id 'HRD-AUTH-20' -Title 'Group Policy objects applied to this computer' `
+                -Category 'AUTH' -Severity 'Low' `
+                -Description ("$($gpoNames.Count) GPO(s) have been applied to the computer: " +
+                              (($gpoNames | Select-Object -First 15) -join '; ') +
+                              '. When a benchmark row below fails, this is where the setting is ' +
+                              'most likely coming from - or not coming from. Run "gpresult /h ' +
+                              'report.html /scope:computer" for the full resultant set of policy.')
+        } else {
+            Add-WgResult -Status 'INFO' -Id 'HRD-AUTH-20' -Title 'Group Policy objects applied to this computer' `
+                -Category 'AUTH' -Severity 'Low' `
+                -Description ('No computer-scope Group Policy history was readable. On a ' +
+                              'domain-joined host that usually means Group Policy has not applied ' +
+                              'successfully - worth confirming with "gpresult /r /scope:computer".')
+        }
+    }
+
 }
 
 
@@ -5622,8 +5866,24 @@ function Invoke-WgPreflight {
         Write-WgLog 'Output is on a network share; make sure the account running the scan can write there.'
     }
     Write-WgLog "SHA-256    : $($script:ScriptSha)"
+    if ($script:IsDomainJoined) {
+        Write-WgLog "Domain     : $($script:DomainName) (domain-joined)"
+    } elseif (-not $script:IsDC) {
+        Write-WgLog 'Domain     : not joined (standalone / workgroup)'
+    }
     if ($script:IncludeDomainPol -and -not $script:IsDC) {
-        Write-WgLog 'Domain pol : enabled - this makes ONE LDAP query to the host''s own domain controller'
+        Write-WgLog 'Domain pol : enabled - this makes ONE query to the host''s own domain controller'
+    }
+
+    # Fetch it before any check runs, so the benchmark rows can reconcile the
+    # local account policy against it rather than reporting half the picture.
+    if ($script:IsDC -or $script:IncludeDomainPol) {
+        $dp = Get-WgDomainPolicy
+        if ($dp) {
+            Write-WgLog "Domain pol : read from $($dp.Source)"
+        } else {
+            Write-WgLog 'Domain pol : could not be read; local policy will be reported on its own'
+        }
     }
     if ($script:WaiverMap.Count -gt 0) {
         Write-WgLog "Waivers    : $($script:WaiverMap.Count) loaded from $($script:WaiverPath)"
@@ -5774,6 +6034,30 @@ function Invoke-WgMain {
     Write-Host ''
     if (-not $script:QuietMode) {
         Write-Host '   Done. Open the HTML report for the full dashboard.' -ForegroundColor Green
+        Write-Host ''
+    }
+
+    # If this is a domain member and the Account Policies rows failed without the
+    # domain policy in hand, the report is only telling half the story. Say so
+    # rather than letting the operator act on it.
+    if ($script:IsDomainJoined -and -not $script:IsDC -and -not $script:IncludeDomainPol) {
+        $acctFails = @($script:Results | Where-Object {
+            $_.status -eq 'FAIL' -and $_.category -match 'ACCOUNT POLICIES' }).Count
+        if ($acctFails -gt 0) {
+            Write-Host ''
+            Write-Host "   NOTE: $acctFails Account Policies check(s) failed against the LOCAL security policy." -ForegroundColor Yellow
+            Write-Host '   This host is domain-joined, so domain accounts are governed by the Default Domain' -ForegroundColor Yellow
+            Write-Host '   Policy instead, which this run did not read. Re-run with -IncludeDomainPolicy to' -ForegroundColor Yellow
+            Write-Host '   reconcile the two and see which of these are genuinely unenforced:' -ForegroundColor Yellow
+            Write-Host '     .\winguard.ps1 -IncludeDomainPolicy' -ForegroundColor Cyan
+            Write-Host ''
+        }
+    }
+    if ($script:AcctPolicyDeferred -gt 0) {
+        Write-Host ''
+        Write-Host "   $($script:AcctPolicyDeferred) Account Policies check(s) were downgraded from FAIL to WARN:" -ForegroundColor Cyan
+        Write-Host '   the domain policy enforces them for domain accounts, but the local value still' -ForegroundColor Cyan
+        Write-Host '   governs local SAM accounts on this server. See each finding for which is which.' -ForegroundColor Cyan
         Write-Host ''
     }
 

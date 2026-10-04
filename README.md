@@ -269,6 +269,14 @@ winguard_reports\        (if created by the script: Administrators + SYSTEM + yo
 Exit codes: `0` scan completed · `1` usage/setup error (or no checks applicable)
 · `2` FAILs present (only with `-Strict`).
 
+Each file is confirmed to exist after it is written and its size is printed, so
+a path that looks right over an empty folder cannot pass for success.
+
+**Auditing over RDP?** If you RDP into the server and point `-Output` at your own
+redirected drive (`\\tsclient\C\...`) the reports come back to *your* machine
+rather than staying on the host — which is usually what you want. The run tells
+you when that is happening.
+
 ---
 
 ## 🔒 Production Safety

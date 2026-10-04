@@ -72,7 +72,7 @@
     bundle for transfer, and fail the pipeline if anything is still open.
 
 .NOTES
-    Version : 1.1.1
+    Version : 1.1.2
     Covers  : Windows Server 2016, 2019, 2022, 2025 (auto-detected; 2012/2012 R2
               best-effort, Windows 10/11 best-effort)
     Sources : CIS Microsoft Windows Server Benchmarks (2016 v3.0.0, 2019 v3.0.0,
@@ -150,7 +150,7 @@ $WarningPreference     = 'SilentlyContinue'
 # GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 $script:ToolName    = 'WinGuard'
-$script:ToolVersion = '1.1.1'
+$script:ToolVersion = '1.1.2'
 $script:ToolEngine  = 'powershell'
 
 $script:StartTime  = Get-Date
@@ -185,6 +185,8 @@ $script:HostName    = $env:COMPUTERNAME
 $script:DomainRole  = 'Unknown'
 
 # Caches - populated lazily, each at most once per run
+$script:ReportWriteFailed = $false
+
 $script:SecEdit      = $null
 $script:SecEditTried = $false
 $script:AuditPol     = $null
@@ -5424,7 +5426,22 @@ function Initialize-WgOutputDir {
             $null = New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop
             $created = $true
         }
-        $full = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
+        # Convert-Path, not Resolve-Path().Path: on a UNC share, an RDP-redirected
+        # drive (\\tsclient\C) or any PSDrive, Resolve-Path returns a
+        # PowerShell-namespace path like
+        #     Microsoft.PowerShell.Core\FileSystem::\\tsclient\C\Users\...
+        # Cmdlets understand that prefix; the .NET APIs this script writes
+        # reports with - StreamWriter, ZipFile, File.OpenRead - do not. Handing
+        # it to them silently writes somewhere else, which looks exactly like a
+        # successful run over an empty output folder.
+        $full = $null
+        try { $full = Convert-Path -LiteralPath $Path -ErrorAction Stop } catch { }
+        if (-not $full) {
+            $rp = Resolve-Path -LiteralPath $Path -ErrorAction Stop
+            $full = if ($rp.ProviderPath) { $rp.ProviderPath } else { "$($rp.Path)" }
+        }
+        # Belt and braces: strip the prefix if a provider path still got through.
+        if ("$full" -match '^.*?FileSystem::(.+)$') { $full = $Matches[1] }
     } catch {
         Write-Host "Cannot create output directory: $Path" -ForegroundColor Red
         exit 1
@@ -5599,6 +5616,11 @@ function Invoke-WgPreflight {
     Write-WgLog "Throttle   : $($script:ThrottleMs)ms"
     Write-WgLog "As admin   : $($script:IsAdmin)"
     Write-WgLog "Output     : $($script:OutputDir)"
+    if ("$($script:OutputDir)" -match '^\\\\tsclient\\') {
+        Write-WgLog 'Output is on an RDP-redirected drive, so the reports land on YOUR machine, not this host.'
+    } elseif ("$($script:OutputDir)" -match '^\\\\') {
+        Write-WgLog 'Output is on a network share; make sure the account running the scan can write there.'
+    }
     Write-WgLog "SHA-256    : $($script:ScriptSha)"
     if ($script:IncludeDomainPol -and -not $script:IsDC) {
         Write-WgLog 'Domain pol : enabled - this makes ONE LDAP query to the host''s own domain controller'
@@ -5717,9 +5739,27 @@ function Invoke-WgMain {
     $hout = Write-WgHtmlReport "$stem.html"
     $cout = Write-WgCsvReport  "$stem.csv"
 
-    Write-Host "   JSON   -> " -NoNewline; Write-Host $jout -ForegroundColor Cyan
-    Write-Host "   HTML   -> " -NoNewline; Write-Host $hout -ForegroundColor Cyan
-    Write-Host "   CSV    -> " -NoNewline; Write-Host $cout -ForegroundColor Cyan
+    # Confirm each file is actually there before claiming it. A path that a
+    # cmdlet accepts and a .NET API resolves differently used to produce three
+    # confident-looking paths over an empty directory.
+    foreach ($f in @(@{ L = 'JSON'; P = $jout }, @{ L = 'HTML'; P = $hout }, @{ L = 'CSV '; P = $cout })) {
+        if (Test-Path -LiteralPath $f.P) {
+            $size = (Get-Item -LiteralPath $f.P).Length
+            Write-Host "   $($f.L)   -> " -NoNewline
+            Write-Host $f.P -ForegroundColor Cyan -NoNewline
+            Write-Host ("  ({0:N0} bytes)" -f $size) -ForegroundColor DarkGray
+        } else {
+            Write-Host "   $($f.L)   -> " -NoNewline
+            Write-Host "NOT WRITTEN: $($f.P)" -ForegroundColor Red
+            $script:ReportWriteFailed = $true
+        }
+    }
+    if ($script:ReportWriteFailed) {
+        Write-Host ''
+        Write-Host '   One or more reports are missing from the path above.' -ForegroundColor Red
+        Write-Host '   Re-run with -Output pointing at a plain local path, for example:' -ForegroundColor Yellow
+        Write-Host '     .\winguard.ps1 -Output C:\Temp\wg' -ForegroundColor Yellow
+    }
 
     if ($script:MakeBundle) {
         $bout = New-WgBundle -Files @($jout, $hout, $cout) -OutDir $script:OutputDir

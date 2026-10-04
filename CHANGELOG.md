@@ -1,5 +1,43 @@
 # Changelog
 
+## [1.1.2] — 2026-10-05 — FIX: reports silently written nowhere on UNC / redirected drives
+
+### Fixed
+
+- **The reports did not land in the directory the run reported.** On a UNC path,
+  an RDP-redirected drive (`\\tsclient\C`) or any PSDrive, `Resolve-Path` returns
+  a *PowerShell-namespace* path:
+
+  ```
+  Microsoft.PowerShell.Core\FileSystem::\\tsclient\C\Users\user\Documents\winguard_reports\
+  ```
+
+  Cmdlets understand that prefix. The .NET APIs this script writes reports with
+  — `StreamWriter`, `ZipFile.CreateFromDirectory`, `File.OpenRead` — do not, and
+  resolve it as a *relative* path instead. `New-Item` (a cmdlet) therefore
+  created the output directory correctly while the writers wrote somewhere else
+  entirely, with no error raised: a clean "Done." over three confident-looking
+  paths and an empty folder.
+
+  `Initialize-WgOutputDir` now returns a native path via `Convert-Path`, falling
+  back to `.ProviderPath`, and strips a `FileSystem::` prefix if one still gets
+  through. Verified by reproducing the failure on a PSDrive: the previous build
+  printed three paths and wrote **zero** files; this one writes three.
+
+  This mattered most in exactly the situation the tool is for — RDP into a
+  server to audit it, with `-Output` on your own redirected drive so the
+  evidence comes back with you.
+
+- **A report that was not written is now reported as such.** Each of the three
+  files is confirmed to exist after writing, and its size is printed. If one is
+  missing the run says `NOT WRITTEN` against that path, in red, and suggests
+  re-running with `-Output` on a plain local path. Three plausible paths over an
+  empty directory should never again look like success.
+
+- The preflight now says when output is going to an RDP-redirected drive — the
+  reports land on *your* machine, not the host being audited — or to any other
+  network share, where the scanning account may not be able to write.
+
 ## [1.1.1] — 2026-10-04 — FIX: output directory locked out the operator
 
 ### Fixed

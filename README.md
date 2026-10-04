@@ -259,7 +259,7 @@ The report is a standalone HTML file — no server required, open in any browser
 ## 📁 Output Files
 
 ```
-winguard_reports\                              (restricted to Administrators + SYSTEM)
+winguard_reports\        (if created by the script: Administrators + SYSTEM + you)
 ├── WinGuard_<hostname>_<timestamp>.html      ← Human dashboard
 ├── WinGuard_<hostname>_<timestamp>.json      ← Machine-readable / baseline input
 ├── WinGuard_<hostname>_<timestamp>.csv       ← Spreadsheet / GRC import
@@ -282,7 +282,7 @@ Exit codes: `0` scan completed · `1` usage/setup error (or no checks applicable
 | ✅ No port scanning | Listening ports are read from local socket state |
 | ✅ Non-admin safe | Runs without elevation, skips privileged checks gracefully |
 | ✅ No installs | No modules, no packages, no downloads |
-| ✅ Protected output | Report directory ACL'd to Administrators + SYSTEM |
+| ✅ Protected output | A report directory the script creates is ACL'd to Administrators, SYSTEM and the account that ran the scan. A directory that already existed is left untouched — the script will not re-permission someone else's folder |
 
 For very busy production systems:
 

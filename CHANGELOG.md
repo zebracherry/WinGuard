@@ -1,5 +1,49 @@
 # Changelog
 
+## [1.1.1] — 2026-10-04 — FIX: output directory locked out the operator
+
+### Fixed
+
+- **The report directory denied access to the account that ran the scan.**
+  `Initialize-WgOutputDir` granted Full Control to Administrators and SYSTEM
+  only, and broke ACL inheritance. Two ways that bit:
+
+  - Run the scan **elevated**, and the reports land in a directory whose ACL
+    names Administrators. A non-elevated Explorer or editor session runs on the
+    *filtered* token, which does not carry Administrators membership, so the
+    operator got "You don't currently have permission to access this folder" on
+    a directory inside their own profile.
+  - Run it **unelevated**, and `Set-Acl` could still succeed (the user owns the
+    directory they just created) — locking them out of their own output
+    entirely.
+
+  The directory is now granted to Administrators, SYSTEM **and the SID of the
+  account that ran the scan** (plus `$env:SUDO_USER` where that is set). The
+  reports are still protected from other users, which was the point, but the
+  operator can read them.
+
+- **A pre-existing output directory is no longer re-permissioned.** The ACL is
+  only rewritten when this run created the directory. Pointing `-Output` at a
+  directory that already existed previously stripped its inherited ACEs and
+  replaced them, which is a destructive surprise on a shared or managed folder
+  and was never the intent. Such a directory is now left exactly as it was, and
+  the run says so.
+
+- When ACL tightening fails (non-NTFS target, redirected or roaming profile, no
+  ownership), the message now names the reason and states that the reports keep
+  the parent's permissions — failing open on readability rather than silently
+  producing files nobody can open. Individual rule removals are guarded too, so
+  one un-removable inherited ACE cannot abandon the grants half-applied.
+
+### If you already have a locked-out directory
+
+Earlier versions may have left one behind. From an elevated prompt:
+
+```powershell
+$dir = "$env:USERPROFILE\Documents\winguard_reports"
+icacls $dir /grant "$($env:USERDOMAIN)\$($env:USERNAME):(OI)(CI)F" /T
+```
+
 ## [1.1.0] — 2026-10-04 — PRIVILEGE-ESCALATION CHECKS + CONSOLE SUMMARY
 
 Adds the local privilege-escalation and bypass checks that a benchmark run does

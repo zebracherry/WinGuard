@@ -15,7 +15,9 @@
     cis | stig | baseline | posture | airgap | all    (default: all)
 
 .PARAMETER Output
-    Output directory (default: .\winguard_reports)
+    Output directory (default: .\winguard_reports). If the script creates it,
+    it is ACL'd to Administrators, SYSTEM and the account that ran the scan. If
+    it already exists, its permissions are left untouched.
 
 .PARAMETER Throttle
     Milliseconds to pause between checks (default: 50)
@@ -70,7 +72,7 @@
     bundle for transfer, and fail the pipeline if anything is still open.
 
 .NOTES
-    Version : 1.1.0
+    Version : 1.1.1
     Covers  : Windows Server 2016, 2019, 2022, 2025 (auto-detected; 2012/2012 R2
               best-effort, Windows 10/11 best-effort)
     Sources : CIS Microsoft Windows Server Benchmarks (2016 v3.0.0, 2019 v3.0.0,
@@ -84,8 +86,11 @@
       - Configurable throttle prevents I/O spikes on busy hosts.
       - Non-admin mode: skips privileged checks cleanly, runs everything else.
       - No network probing, no port scanning, no installs.
-      - Reports are written to a directory locked down to Administrators + SYSTEM
-        (they describe your weaknesses).
+      - A report directory created by this script is locked down to
+        Administrators, SYSTEM and the account that ran the scan (the reports
+        describe your weaknesses). A directory that already existed is left
+        exactly as it was - the script does not re-permission someone else's
+        folder.
 
 .LINK
     https://github.com/zebracherry/WinGuard
@@ -145,7 +150,7 @@ $WarningPreference     = 'SilentlyContinue'
 # GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 $script:ToolName    = 'WinGuard'
-$script:ToolVersion = '1.1.0'
+$script:ToolVersion = '1.1.1'
 $script:ToolEngine  = 'powershell'
 
 $script:StartTime  = Get-Date
@@ -5412,29 +5417,77 @@ function New-WgBundle {
 # ─────────────────────────────────────────────────────────────────────────────
 function Initialize-WgOutputDir {
     param([string] $Path)
+
+    $created = $false
     try {
         if (-not (Test-Path -LiteralPath $Path)) {
             $null = New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop
+            $created = $true
         }
         $full = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path
     } catch {
         Write-Host "Cannot create output directory: $Path" -ForegroundColor Red
         exit 1
     }
+
+    # Only re-permission a directory this run created. A directory that already
+    # existed belongs to whoever set it up - replacing its ACL because reports
+    # are about to be written into it would be a destructive surprise.
+    if (-not $created) {
+        Write-WgLog 'Output directory already existed; its permissions were left unchanged.'
+        return $full
+    }
+
     try {
-        $acl = New-Object System.Security.AccessControl.DirectorySecurity
-        $acl.SetAccessRuleProtection($true, $false)     # drop inherited ACEs
+        $acl = Get-Acl -LiteralPath $full -ErrorAction Stop
+        $acl.SetAccessRuleProtection($true, $false)   # drop inherited ACEs
+
+        # Remove whatever survived protection, so the result is exactly the
+        # principals granted below. Removal is individually guarded: .NET throws
+        # on an inherited rule, and failing to strip one extra ACE is far better
+        # than abandoning the grants and locking the operator out.
+        foreach ($rule in @($acl.Access)) {
+            try { [void] $acl.RemoveAccessRule($rule) } catch { }
+        }
+
+        $grantees = New-Object System.Collections.ArrayList
         foreach ($sid in @('S-1-5-32-544', 'S-1-5-18')) {   # Administrators, SYSTEM
-            $id = New-Object System.Security.Principal.SecurityIdentifier($sid)
+            [void] $grantees.Add((New-Object System.Security.Principal.SecurityIdentifier($sid)))
+        }
+
+        # The account that ran the scan, by SID. This is the part that matters:
+        # when the scan runs elevated, the operator's own non-elevated Explorer
+        # session uses a filtered token WITHOUT Administrators, so an
+        # Administrators-only ACL locks them out of their own reports.
+        try {
+            $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            if ($me) { [void] $grantees.Add($me) }
+        } catch { }
+
+        # Under "runas /user:" or sudo-style elevation the reports are usually
+        # wanted by the user who initiated it, not just the elevated account.
+        foreach ($envUser in @($env:SUDO_USER)) {
+            if (-not $envUser) { continue }
+            try {
+                $acct = New-Object Security.Principal.NTAccount($envUser)
+                [void] $grantees.Add($acct.Translate([Security.Principal.SecurityIdentifier]))
+            } catch { }
+        }
+
+        foreach ($id in ($grantees | Select-Object -Unique)) {
             $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
                 $id, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
         }
+
         Set-Acl -LiteralPath $full -AclObject $acl -ErrorAction Stop
     } catch {
-        # Tightening the ACL is best-effort: on a non-NTFS target, or without
-        # ownership of an existing directory, it can legitimately fail. The scan
-        # still runs; the operator is told so they can protect the files.
-        Write-WgLog 'Could not restrict the output directory ACL; protect the reports manually.'
+        # Tightening the ACL is best-effort: on a non-NTFS target, a redirected
+        # or roaming profile, or without ownership, it can legitimately fail.
+        # The scan still runs - the reports are simply left with the inherited
+        # permissions of their parent, which is the safe direction to fail in.
+        Write-WgLog ('Could not restrict the output directory ACL (' +
+                     "$($_.Exception.GetType().Name)); the reports keep the parent's " +
+                     'permissions. Protect them manually if that matters here.')
     }
     return $full
 }

@@ -1,0 +1,17 @@
+# WinGuard ships a PowerShell script that runs on Windows. PowerShell is happy
+# with either line ending, but CRLF is the platform norm and it keeps an
+# Authenticode signature block valid if the script is signed for distribution,
+# so the .ps1 is normalised to CRLF on checkout regardless of the clone's
+# core.autocrlf setting.
+#
+# Everything else is kept at LF, so SHA256SUMS verification and diffs behave the
+# same on the Linux side of an air-gap transfer as on the Windows side.
+* text=auto eol=lf
+
+*.ps1  text eol=crlf
+
+*.md   text eol=lf
+*.txt  text eol=lf
+
+SHA256SUMS text eol=lf
+LICENSE    text eol=lf

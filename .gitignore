@@ -1,0 +1,12 @@
+winguard_reports/
+*.log
+# Keep example reports and scan output out of git
+*.json
+*.html
+*.csv
+*.zip
+!docs/
+# Build intermediates for the embedded benchmark tables
+.build/
+__pycache__/
+*.pyc

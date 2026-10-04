@@ -1,0 +1,17 @@
+# WinGuard waiver file — one accepted deviation per line:
+#   CHECK-ID | reason / approval reference
+# Matching FAIL/WARN results become WAIVED (excluded from the score, reason shown
+# in the reports). Waiving a base ID also covers auto-suffixed duplicates
+# (e.g. CIS-1.1.1 covers CIS-1.1.1.2). Lines starting with # are ignored.
+
+# ── Air-gap deviations ───────────────────────────────────────────────────────
+AIR-TELEM-4     | MAPS left enabled for vendor EDR integration — CAB-0000
+AIR-WU-1        | Patched from offline media, no WSUS in this enclave — SOP-0000
+
+# ── Benchmark deviations ─────────────────────────────────────────────────────
+CIS-18.10.3.1   | Breaks the line-of-business print path — RISK-0000
+STIG-V-254275   | FS-SMB1 required by legacy scanner appliance — POAM-0000
+
+# ── Posture deviations ───────────────────────────────────────────────────────
+HRD-INSE-20     | This host is the print server — by design
+HRD-STRG-1      | Encrypted at the SAN/array layer instead — ARCH-0000

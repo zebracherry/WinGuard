@@ -25,17 +25,17 @@ estate can be audited and tracked the same way.
 | **CIS Benchmarks** | Windows Server 2016, 2019, 2022, 2025 — Level 1, Member Server + Domain Controller (auto-selected by detected build and role) |
 | **DISA STIG** | Server 2016 V2R10, 2019 V3R8, 2022 V2R8, 2025 V1R1 — CAT I/II/III, MS and DC variants |
 | **Microsoft Security Baseline** | Security Compliance Toolkit settings for Server 2022 / 2025, including the ones where Microsoft and CIS **disagree** |
-| **Hardening Posture** | Built-in scanner across 15 categories: AUTH BOOT CRYP INSE KRNL LOGG MALW PKGS SCHD SHLL STRG TIME TOOL USERS HRDN |
+| **Hardening Posture** | Built-in scanner across 15 categories: AUTH BOOT CRYP INSE KRNL LOGG MALW PKGS SCHD SHLL STRG TIME TOOL USERS HRDN — including local privilege-escalation and bypass checks (writable `%PATH%`, TPM-only BitLocker, WDAC audit-vs-enforce, AppLocker service state) |
 | **Air-Gap Isolation** | Egress & bridging, radios (Wi-Fi/BT/WWAN/USB-tether), DMA ports, phone-home services, telemetry, update source, patch & signature age, NTP/log/tunnel exposure |
 
 ### Checks per platform
 
 | Detected host | CIS | STIG | MS Baseline | Posture | Air-gap | **Total** |
 |---|---|---|---|---|---|---|
-| Server 2016 (MS / DC) | 419 / 411 | 185 / 186 | — | ~93 | ~42 | **~739 / 732** |
-| Server 2019 (MS / DC) | 434 / 432 | 185 / 188 | — | ~93 | ~42 | **~754 / 755** |
-| Server 2022 (MS / DC) | 460 / 457 | 185 / 188 | 156 / 155 | ~93 | ~42 | **~936 / 935** |
-| Server 2025 (MS / DC) | 477 / 474 | 177 / 184 | 180 / 181 | ~93 | ~42 | **~969 / 974** |
+| Server 2016 (MS / DC) | 419 / 411 | 185 / 186 | — | ~107 | ~43 | **~754 / 747** |
+| Server 2019 (MS / DC) | 434 / 432 | 185 / 188 | — | ~107 | ~43 | **~769 / 770** |
+| Server 2022 (MS / DC) | 460 / 457 | 185 / 188 | 156 / 155 | ~107 | ~43 | **~951 / 950** |
+| Server 2025 (MS / DC) | 477 / 474 | 177 / 184 | 180 / 181 | ~107 | ~43 | **~984 / 989** |
 
 Microsoft publishes Security Baseline content for Server 2022 and 2025 only; on
 2016/2019 WinGuard says so in the report rather than silently scoring zero.
@@ -100,6 +100,7 @@ OPTIONS:
   -Bundle                Pack reports + MANIFEST + SHA256SUMS into a .zip
   -Strict                Exit 2 if any FAIL remains (CI / automation)
   -IncludeManual         Also list the STIG rules that need manual review, as INFO
+  -IncludeDomainPolicy   Also audit the Default Domain Password Policy (see below)
   -Quiet                 Suppress per-check output (summary still printed)
 ```
 
@@ -129,7 +130,28 @@ case-insensitive, so `-B` would collide with `-b`; `-Bu` works.
 
 # Complete STIG checklist, including the rules a script cannot determine
 .\winguard.ps1 -Mode stig -IncludeManual
+
+# Also audit the Default Domain Password Policy (one LDAP query to your own DC)
+.\winguard.ps1 -IncludeDomainPolicy
 ```
+
+### A note on `-IncludeDomainPolicy`
+
+The account-policy rows in the CIS and STIG sections read the **local** security
+policy. On a domain-joined server that is *not* the policy governing domain
+accounts — the Default Domain Policy at the DC is. `-IncludeDomainPolicy` audits
+that too (minimum length, complexity, reversible encryption, lockout threshold
+and duration).
+
+It is off by default because it is the only check in the tool that leaves the
+host: it makes one LDAP query to this machine's own domain controller. On a
+domain controller it runs automatically, because there the data is local. It
+needs the `ActiveDirectory` RSAT module; without it the check reports SKIP and
+says why rather than guessing.
+
+Fine-grained password policies (PSOs) override the default policy for specific
+users and groups — WinGuard flags that in the finding text and points you at
+`Get-ADFineGrainedPasswordPolicy`, but does not enumerate them.
 
 ---
 
@@ -256,7 +278,7 @@ Exit codes: `0` scan completed · `1` usage/setup error (or no checks applicable
 | ✅ Read-only | Zero system modifications made |
 | ✅ No service restarts | Nothing interrupted |
 | ✅ Configurable throttle | `-Throttle 200` for I/O-sensitive systems |
-| ✅ No network probing | All checks are local only |
+| ✅ No network probing | All checks are local only, unless `-IncludeDomainPolicy` is passed |
 | ✅ No port scanning | Listening ports are read from local socket state |
 | ✅ Non-admin safe | Runs without elevation, skips privileged checks gracefully |
 | ✅ No installs | No modules, no packages, no downloads |
@@ -369,6 +391,23 @@ STIG revisions.
 | TOOL | Firewall enabled per profile, default inbound Block, AppLocker/WDAC policy present |
 | HRDN | SMB server/client signing, LDAP client signing, DC LDAP signing + channel binding, null-session pipes/shares, listening port inventory, plaintext legacy listeners |
 
+### Local privilege-escalation and bypass checks
+
+These look for exploitable conditions rather than policy compliance, which is a
+different question from "does this match the benchmark":
+
+| Check | What it catches |
+|---|---|
+| `HRD-STRG-5` | **TPM-only BitLocker.** Protected volumes with no pre-boot authentication — the disk unlocks before anyone authenticates, so a stolen machine is readable via LPC/SPI bus sniffing or a DMA attack |
+| `HRD-SCHD-4` | **Writable `%PATH%` directories.** Matched by well-known SID, not account name, so it still works on a non-English Windows — the usual reason this check wrongly reports clean |
+| `HRD-TOOL-4/5` | **WDAC in audit mode.** A policy that logs what it would have blocked and blocks nothing. Deployed ≠ enforced |
+| `HRD-TOOL-6` | **AppLocker with a stopped `AppIDSvc`.** Rules are evaluated by that service, so the policy enforces nothing while the host looks protected |
+| `HRD-INSE-31` | **`AlwaysInstallElevated` in both hives.** Only exploitable when HKLM *and* HKCU are set; reported separately so you know whether it is live or one policy change away |
+| `HRD-SHLL-3` | **FullLanguage PowerShell under enforced app control**, which means the policy does not cover PowerShell and can be bypassed through it |
+| `HRD-KRNL-8/9/10` | Driver co-installers, the DataProtection DMA policy, and whether HVCI is UEFI-locked against a local admin turning it off |
+| `HRD-STRG-6/7` | **Recall / Windows AI** policy state, plus on-disk `ukg.db` and `ImageStore` artefacts — evidence it ran, regardless of the current policy |
+| `AIR-WU-5` | **WSUS over cleartext HTTP** (pywsus / WSUSpect). An internal WSUS does not make this safe; it only narrows who can reach it |
+
 ---
 
 ## 🧪 How The Benchmark Data Was Built
@@ -402,6 +441,7 @@ shipped default already satisfies this" as a PASS with that explanation, and
 - [HardeningKitty](https://github.com/0x6d69636b/windows_hardening) *(source of the CIS and Microsoft baseline transcriptions)*
 - [NIST 800-53](https://nvd.nist.gov/800-53)
 - [RHELGuard](https://github.com/zebracherry/RHELGuard) *(the Linux counterpart)*
+- [Client-Checker by @LuemmelSec](https://github.com/LuemmelSec/Client-Checker) *(inspiration for the local privilege-escalation checks and the console summary layout)*
 
 ---
 

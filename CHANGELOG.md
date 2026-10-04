@@ -1,5 +1,93 @@
 # Changelog
 
+## [1.1.0] — 2026-10-04 — PRIVILEGE-ESCALATION CHECKS + CONSOLE SUMMARY
+
+Adds the local privilege-escalation and bypass checks that a benchmark run does
+not cover, after comparing WinGuard against
+[Client-Checker by @LuemmelSec](https://github.com/LuemmelSec/Client-Checker).
+Of its 42 checks, 30 were already covered; these are the 12 that were not.
+
+### New checks (14 new IDs)
+
+Where the two tools disagree on judgement, the reasoning is in the finding text
+rather than implied by a colour.
+
+- **`HRD-STRG-5` — BitLocker pre-boot authentication.** Previously only
+  `ProtectionStatus` was checked. TPM-only BitLocker unlocks the disk before
+  anyone authenticates, so it does not defend against an attacker holding the
+  powered-off machine. Protector sets are now classified: TPM+PIN/password
+  passes, a removable startup key warns, TPM alone fails.
+- **`HRD-SCHD-4` — writable directories on the machine `%PATH%`.** DLL
+  search-order hijacking. Identities are matched by **well-known SID**, not by
+  account name, so it still works on a non-English Windows — a name comparison
+  is the usual way this check is written and the usual reason it reports a clean
+  result on a bad host. Reads the machine PATH, not the process PATH, so a
+  user-scoped entry is not reported as a system-wide hijack.
+- **`HRD-TOOL-4` / `HRD-TOOL-5` — WDAC enforcement status.** WinGuard detected
+  whether a policy *existed*; it now reads
+  `CodeIntegrityPolicyEnforcementStatus` and the user-mode equivalent, so a
+  policy stuck in **audit mode** — logging what it would have blocked and
+  blocking nothing — is reported as such.
+- **`HRD-TOOL-6` — AppLocker actually enforcing.** A deployed policy with a
+  stopped `AppIDSvc` enforces nothing while the host looks protected, so that
+  combination is a FAIL rather than a pass.
+- **`HRD-INSE-31` — `AlwaysInstallElevated` in both hives.** The escalation
+  needs HKLM *and* HKCU; reporting only HKLM could not establish whether it was
+  live. Both are now read and the verdict says which.
+- **`HRD-SHLL-3` — PowerShell language mode, judged in context.**
+  FullLanguage is the Windows default and is not a finding on its own —
+  ConstrainedLanguage is a *consequence* of enforced application control, not a
+  setting to apply by itself. So: ConstrainedLanguage passes; FullLanguage with
+  app control enforced is a FAIL (the policy does not cover PowerShell and can
+  be bypassed through it); FullLanguage without app control is INFO.
+- **`HRD-KRNL-8`** driver co-installers (`DisableCoInstallers`, both the legacy
+  and policy locations), **`HRD-KRNL-9`** the DataProtection
+  `DeviceLock\AllowDirectMemoryAccess` policy — a different control from the
+  `DmaSecurity` value `HRD-KRNL-6` already covered — and **`HRD-KRNL-10`** HVCI
+  `LockConfiguration`, which decides whether a local administrator can turn
+  memory integrity off with a registry write and a reboot.
+- **`HRD-STRG-6` / `HRD-STRG-7` — Recall / Windows AI.** Policy state across the
+  machine hive and every loaded user hive, plus on-disk `ukg.db` and `ImageStore`
+  artefacts, which are evidence it ran regardless of the policy now.
+- **`HRD-INSE-32` — IPv6 binding (mitm6).** Reported as INFO, deliberately not
+  failed: mitm6 abuses rogue DHCPv6/RA on the wire, Microsoft does not support
+  disabling IPv6, and neither CIS nor STIG requires it. RA Guard and DHCPv6
+  Guard are the actual fix, and the finding says so.
+- **`HRD-PKGS-3`** installed software inventory, and **`AIR-WU-5`** WSUS reached
+  over cleartext HTTP (pywsus / WSUSpect) — independently exploitable even when
+  the WSUS server itself is internal, which `AIR-WU-1` alone did not capture.
+- **`HRD-AUTH-13`–`HRD-AUTH-18` — Default Domain Password Policy**, behind the
+  new `-IncludeDomainPolicy` switch. The account-policy rows in the CIS and STIG
+  sections read the **local** security policy, which does not govern domain
+  accounts on a domain-joined host. This is the only check that leaves the
+  machine (one LDAP query to its own DC), so it is off by default and runs
+  automatically only on a domain controller, where the data is local. The
+  finding text flags that a fine-grained password policy can override it.
+
+### Console output
+
+Reworked along the lines of Client-Checker, which is easier to read live:
+
+- Section banners are now boxed and print the **reference URLs** for that
+  section, so a finding can be argued from the source without leaving the
+  terminal.
+- A **results-by-category table** at the end (OK / MAYBE / BAD / INFO / N/T per
+  category and framework), coloured by the worst result in each row.
+- A **"findings to act on"** table, worst first by status then severity. A
+  ~950-check run cannot print one row per check and stay readable, so this is
+  capped at 40 with a pointer to the reports for the rest.
+- Colours follow the convention the team already reads: green OK, magenta
+  "might be", red bad, yellow could-not-test.
+
+### Fixed
+
+- Checks that could silently produce **no result at all** on hosts lacking a
+  data source (`HRD-TOOL-5` without `Win32_DeviceGuard`, `HRD-INSE-32` without
+  `Get-NetAdapterBinding`, `AIR-WU-5` with no WSUS configured) now always emit a
+  row. A check that appears on some hosts and not others shows up in the
+  `-Baseline` drift panel as a check that was removed, which is noise in exactly
+  the report meant to show real change.
+
 ## [1.0.0] — 2026-10-04 — INITIAL RELEASE
 
 First release of WinGuard, the Windows Server counterpart to

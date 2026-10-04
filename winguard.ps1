@@ -40,6 +40,15 @@
 .PARAMETER Strict
     Exit 2 if any FAIL remains (for CI / automation)
 
+.PARAMETER IncludeDomainPolicy
+    Also audit the Default Domain Password Policy. This is the only check that
+    leaves the host: it makes one LDAP query to this machine's own domain
+    controller, so it is off by default to keep the rest of the tool strictly
+    local. On a domain controller it runs anyway, because there it is local.
+
+    It matters because the account-policy rows in the CIS/STIG sections read the
+    LOCAL security policy, which does not govern domain accounts.
+
 .PARAMETER IncludeManual
     Also emit the STIG rules that cannot be checked automatically, as INFO rows,
     so the report covers the full STIG rather than just the automatable part.
@@ -61,7 +70,7 @@
     bundle for transfer, and fail the pipeline if anything is still open.
 
 .NOTES
-    Version : 1.0.0
+    Version : 1.1.0
     Covers  : Windows Server 2016, 2019, 2022, 2025 (auto-detected; 2012/2012 R2
               best-effort, Windows 10/11 best-effort)
     Sources : CIS Microsoft Windows Server Benchmarks (2016 v3.0.0, 2019 v3.0.0,
@@ -117,6 +126,8 @@ param(
 
     [switch] $IncludeManual,
 
+    [switch] $IncludeDomainPolicy,
+
     [Alias('q')]
     [switch] $Quiet
 )
@@ -134,7 +145,7 @@ $WarningPreference     = 'SilentlyContinue'
 # GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 $script:ToolName    = 'WinGuard'
-$script:ToolVersion = '1.0.0'
+$script:ToolVersion = '1.1.0'
 $script:ToolEngine  = 'powershell'
 
 $script:StartTime  = Get-Date
@@ -187,11 +198,18 @@ function Write-WgLine {
 }
 function Write-WgLog    { param([string] $m) Write-WgLine "[*] $m" 'Cyan' }
 function Write-WgBanner {
-    param([string] $m)
+    param([string] $m, [string[]] $References = @())
     if ($script:QuietMode) { return }
+    $w = [Math]::Max(46, $m.Length + 4)
+    $rule = '#' * $w
     Write-Host ''
-    Write-Host "  ── $m " -ForegroundColor Magenta -NoNewline
-    Write-Host ('─' * [Math]::Max(0, 58 - $m.Length)) -ForegroundColor DarkGray
+    Write-Host "  $rule" -ForegroundColor DarkCyan
+    Write-Host ('  # {0} #' -f $m.PadRight($w - 4)) -ForegroundColor DarkCyan
+    Write-Host "  $rule" -ForegroundColor DarkCyan
+    foreach ($r in $References) {
+        if ($r) { Write-Host "  Reference: $r" -ForegroundColor DarkGray }
+    }
+    Write-Host ''
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2381,7 +2399,10 @@ function Add-WgRegCheck {
 function Invoke-WgPostureChecks {
 
     # ── AUTH: authentication and credential exposure ─────────────────────────
-    Write-WgBanner 'POSTURE - AUTH: credentials & authentication'
+    Write-WgBanner 'POSTURE - AUTH: credentials & authentication' @(
+        'https://itm4n.github.io/lsass-runasppl/'
+        'https://learn.microsoft.com/en-us/windows-server/security/credentials-protection-and-management/configuring-additional-lsa-protection'
+    )
 
     Add-WgRegCheck -Id 'HRD-AUTH-1' -Title 'WDigest does not cache plaintext credentials' `
         -Category 'AUTH' -Severity 'High' `
@@ -2479,7 +2500,9 @@ function Invoke-WgPostureChecks {
         -IfAbsent 'PASS' -AbsentNote 'Not set; the Windows default of 0 is compliant.'
 
     # ── USERS: local account hygiene ─────────────────────────────────────────
-    Write-WgBanner 'POSTURE - USERS: local account hygiene'
+    Write-WgBanner 'POSTURE - USERS: local account hygiene' @(
+        'https://learn.microsoft.com/en-us/windows-server/identity/laps/laps-overview'
+    )
 
     $locals = Get-WgWmi -Class Win32_UserAccount -Filter "LocalAccount=True"
     if ($locals) {
@@ -2539,7 +2562,9 @@ function Invoke-WgPostureChecks {
     }
 
     # ── BOOT: platform integrity ─────────────────────────────────────────────
-    Write-WgBanner 'POSTURE - BOOT: platform & boot integrity'
+    Write-WgBanner 'POSTURE - BOOT: platform & boot integrity' @(
+        'https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/oem-secure-boot'
+    )
 
     if (Get-Command Confirm-SecureBootUEFI -ErrorAction SilentlyContinue) {
         $sb = $null
@@ -2616,7 +2641,10 @@ function Invoke-WgPostureChecks {
     }
 
     # ── CRYP: TLS, cipher suites, FIPS ───────────────────────────────────────
-    Write-WgBanner 'POSTURE - CRYP: protocols & cipher suites'
+    Write-WgBanner 'POSTURE - CRYP: protocols & cipher suites' @(
+        'https://learn.microsoft.com/en-us/windows-server/security/tls/tls-registry-settings'
+        'https://learn.microsoft.com/en-us/dotnet/framework/network-programming/tls'
+    )
 
     $schannel = 'HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL'
     $weakProtos = @('SSL 2.0', 'SSL 3.0', 'TLS 1.0', 'TLS 1.1')
@@ -2709,7 +2737,10 @@ function Invoke-WgPostureChecks {
     }
 
     # ── KRNL: exploit mitigations and kernel protection ──────────────────────
-    Write-WgBanner 'POSTURE - KRNL: kernel & exploit mitigations'
+    Write-WgBanner 'POSTURE - KRNL: kernel & exploit mitigations' @(
+        'https://learn.microsoft.com/en-us/windows/security/hardware-security/enable-virtualization-based-protection-of-code-integrity'
+        'https://itm4n.github.io/printnightmare-exploitation/'
+    )
 
     $dg = Get-WgWmi -Class Win32_DeviceGuard -Namespace 'root\Microsoft\Windows\DeviceGuard'
     if ($dg) {
@@ -2768,7 +2799,10 @@ function Invoke-WgPostureChecks {
                      'a non-administrator can install a printer driver and run code as SYSTEM.')
 
     # ── Signing: SMB and LDAP ────────────────────────────────────────────────
-    Write-WgBanner 'POSTURE - HRDN: SMB & LDAP signing'
+    Write-WgBanner 'POSTURE - HRDN: SMB & LDAP signing' @(
+        'https://techcommunity.microsoft.com/t5/storage-at-microsoft/configure-smb-signing-with-confidence/ba-p/2418102'
+        'https://support.microsoft.com/en-us/topic/2020-2023-and-2024-ldap-channel-binding-and-ldap-signing-requirements-f7bc2dc0'
+    )
 
     Add-WgRegCheck -Id 'HRD-HRDN-1' -Title 'SMB server requires packet signing' -Category 'HRDN' `
         -Severity 'High' -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters' `
@@ -2803,7 +2837,10 @@ function Invoke-WgPostureChecks {
         -Item 'RestrictNullSessAccess' -Expected '1'
 
     # ── INSE: insecure services and legacy protocols ─────────────────────────
-    Write-WgBanner 'POSTURE - INSE: insecure services & legacy protocols'
+    Write-WgBanner 'POSTURE - INSE: insecure services & legacy protocols' @(
+        'https://learn.microsoft.com/en-us/windows-server/storage/file-server/troubleshoot/detect-enable-and-disable-smbv1-v2-v3'
+        'https://luemmelsec.github.io/Relaying-101/'
+    )
 
     $smb1Reg  = Get-WgRegValue 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'SMB1'
     $mrxsmb10 = Get-WgServiceStart 'mrxsmb10'
@@ -2964,7 +3001,9 @@ function Invoke-WgPostureChecks {
     }
 
     # ── MALW: anti-malware ───────────────────────────────────────────────────
-    Write-WgBanner 'POSTURE - MALW: anti-malware'
+    Write-WgBanner 'POSTURE - MALW: anti-malware' @(
+        'https://learn.microsoft.com/en-us/defender-endpoint/attack-surface-reduction'
+    )
 
     $mp = $null
     if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
@@ -3045,7 +3084,10 @@ function Invoke-WgPostureChecks {
     }
 
     # ── LOGG: audit and logging ──────────────────────────────────────────────
-    Write-WgBanner 'POSTURE - LOGG: audit & logging'
+    Write-WgBanner 'POSTURE - LOGG: audit & logging' @(
+        'https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_logging_windows'
+        'https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/appendix-l--events-to-monitor'
+    )
 
     $psPol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell'
     Add-WgRegCheck -Id 'HRD-LOGG-1' -Title 'PowerShell script block logging is enabled' `
@@ -3110,7 +3152,9 @@ function Invoke-WgPostureChecks {
             'Sysmon is not installed. It is optional, but it is the cheapest large gain in host telemetry.' })
 
     # ── SHLL: shells and scripting ───────────────────────────────────────────
-    Write-WgBanner 'POSTURE - SHLL: shells & scripting'
+    Write-WgBanner 'POSTURE - SHLL: shells & scripting' @(
+        'https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.security/set-executionpolicy'
+    )
 
     $lmPol = Get-WgRegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell' 'ExecutionPolicy'
     $effective = $null
@@ -3136,7 +3180,9 @@ function Invoke-WgPostureChecks {
             '-Name Enabled -PropertyType DWord -Value 0 -Force' })
 
     # ── STRG: storage and removable media ────────────────────────────────────
-    Write-WgBanner 'POSTURE - STRG: storage & removable media'
+    Write-WgBanner 'POSTURE - STRG: storage & removable media' @(
+        'https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/'
+    )
 
     if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
         $vols = $null
@@ -3221,7 +3267,9 @@ function Invoke-WgPostureChecks {
     }
 
     # ── SCHD: scheduled tasks, autoruns and service paths ────────────────────
-    Write-WgBanner 'POSTURE - SCHD: scheduled tasks & service paths'
+    Write-WgBanner 'POSTURE - SCHD: scheduled tasks & service paths' @(
+        'https://learn.microsoft.com/en-us/windows/win32/services/service-record-list'
+    )
 
     # Unquoted service image paths containing spaces are a classic local
     # privilege-escalation primitive.
@@ -3357,7 +3405,9 @@ function Invoke-WgPostureChecks {
         -Remediation $(if ($pending.Count -eq 0) { '' } else { 'Schedule a reboot to complete servicing' })
 
     # ── TIME: time synchronisation ───────────────────────────────────────────
-    Write-WgBanner 'POSTURE - TIME: time synchronisation'
+    Write-WgBanner 'POSTURE - TIME: time synchronisation' @(
+        'https://learn.microsoft.com/en-us/windows-server/networking/windows-time-service/windows-time-service-top'
+    )
 
     $w32 = Get-WgServiceStart 'W32Time'
     $w32Running = Test-WgServiceRunning 'W32Time'
@@ -3379,7 +3429,9 @@ function Invoke-WgPostureChecks {
             'w32tm /config /manualpeerlist:"<internal-ntp>" /syncfromflags:manual /update' })
 
     # ── TOOL: control and enforcement tooling ────────────────────────────────
-    Write-WgBanner 'POSTURE - TOOL: firewall & application control'
+    Write-WgBanner 'POSTURE - TOOL: firewall & application control' @(
+        'https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/best-practices-configuring'
+    )
 
     $fwProfiles = @('DomainProfile', 'PrivateProfile', 'PublicProfile')
     $fwOff = @(); $fwAllowIn = @()
@@ -3712,7 +3764,9 @@ function Invoke-WgAirgapChecks {
     }
 
     # ── AIR-DMA / removable media ────────────────────────────────────────────
-    Write-WgBanner 'AIR-GAP - DMA & removable media'
+    Write-WgBanner 'AIR-GAP - DMA & removable media' @(
+        'https://www.synacktiv.com/en/publications/practical-dma-attack-on-windows-10.html'
+    )
 
     Add-WgRegCheck -Id 'AIR-DMA-1' -Title 'DMA under lock is not permitted' `
         -Category 'AIR-GAP DMA' -Framework 'AIRGAP' -Severity 'High' `
@@ -3772,7 +3826,9 @@ function Invoke-WgAirgapChecks {
     }
 
     # ── AIR-TELEM: telemetry and cloud content ───────────────────────────────
-    Write-WgBanner 'AIR-GAP - TELEM: telemetry & cloud features'
+    Write-WgBanner 'AIR-GAP - TELEM: telemetry & cloud features' @(
+        'https://learn.microsoft.com/en-us/windows/privacy/configure-windows-diagnostic-data-in-your-organization'
+    )
 
     Add-WgRegCheck -Id 'AIR-TELEM-1' -Title 'Telemetry is set to the minimum level' `
         -Category 'AIR-GAP TELEMETRY' -Framework 'AIRGAP' -Severity 'High' `
@@ -3823,7 +3879,9 @@ function Invoke-WgAirgapChecks {
                      'msftconnecttest.com to decide whether it is online.')
 
     # ── AIR-WU: update source ────────────────────────────────────────────────
-    Write-WgBanner 'AIR-GAP - WU: update source & patch currency'
+    Write-WgBanner 'AIR-GAP - WU: update source & patch currency' @(
+        'https://www.gosecure.net/blog/2020/09/03/wsus-attacks-part-1-introducing-pywsus/'
+    )
 
     $wuPol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
     $wsus  = Get-WgRegValue $wuPol 'WUServer'
@@ -3864,6 +3922,38 @@ function Invoke-WgAirgapChecks {
         -Remediation $(if ("$doMode" -eq '0' -or "$doMode" -eq '99' -or "$doMode" -eq '100') { '' } else {
             "Set DODownloadMode to 0 (HTTP only) or 99 (simple) under " +
             "'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization'" })
+
+    # WSUS over cleartext HTTP is independently exploitable: an on-path attacker
+    # can serve a signed-but-attacker-chosen update (pywsus / WSUSpect) and get
+    # SYSTEM, regardless of whether the server itself is internal.
+    $wuSrv = Get-WgRegValue $wuPol 'WUServer'
+    $wuSt  = Get-WgRegValue $wuPol 'WUStatusServer'
+    if (-not $wuSrv -and -not $wuSt) {
+        # Still emit the row: a check that only appears on some hosts shows up as
+        # a removed check in the -Baseline drift panel.
+        Add-WgResult -Status 'PASS' -Id 'AIR-WU-5' `
+            -Title 'WSUS is reached over HTTPS, not cleartext HTTP' -Category 'AIR-GAP UPDATES' `
+            -Framework 'AIRGAP' -Severity 'High' `
+            -Description ('No update server endpoint is configured, so there is no cleartext ' +
+                          'WSUS channel to attack. AIR-WU-1 covers whether updates reach this ' +
+                          'host at all.')
+    } else {
+        $plain = @(@($wuSrv, $wuSt) | Where-Object { $_ -and "$_" -match '^(?i)http://' })
+        Add-WgResult -Status $(if ($plain.Count -gt 0) { 'FAIL' } else { 'PASS' }) -Id 'AIR-WU-5' `
+            -Title 'WSUS is reached over HTTPS, not cleartext HTTP' -Category 'AIR-GAP UPDATES' `
+            -Framework 'AIRGAP' -Severity 'High' `
+            -Description $(if ($plain.Count -gt 0) {
+                ('The update server is configured over cleartext HTTP: ' +
+                 (($plain | ForEach-Object { Get-WgUrlHost $_ }) -join ', ') +
+                 '. An attacker on the path can inject a malicious update and execute code as ' +
+                 'SYSTEM, because the transport is unauthenticated even though the packages are ' +
+                 'signed. An internal WSUS does not make this safe - it only narrows who can reach it.')
+            } else {
+                'The configured update server endpoints use HTTPS.'
+            }) `
+            -Remediation $(if ($plain.Count -gt 0) {
+                'Reconfigure WUServer and WUStatusServer to https:// with a certificate the clients trust' } else { '' })
+    }
 
     Add-WgRegCheck -Id 'AIR-WU-4' -Title 'Microsoft Store is disabled' `
         -Category 'AIR-GAP UPDATES' -Framework 'AIRGAP' -Severity 'Low' `
@@ -4026,6 +4116,602 @@ function Invoke-WgAirgapChecks {
         Add-WgResult -Status 'INFO' -Id 'AIR-LOG-1' -Title 'Log forwarding stays inside the enclave' `
             -Category 'AIR-GAP LOGGING' -Framework 'AIRGAP' -Severity 'Low' `
             -Description 'No Windows Event Forwarding subscription is configured, so no logs leave the host.'
+    }
+}
+
+
+# =============================================================================
+#  EXTENDED POSTURE CHECKS
+#
+#  Local privilege-escalation and bypass checks that no single CIS or STIG line
+#  item asserts. Several are modelled on LuemmelSec's Client-Checker, which goes
+#  looking for exploitable conditions rather than policy compliance - a useful
+#  complement to a benchmark run.
+#
+#  Where the two disagree on judgement, the reasoning is in the finding text so
+#  the verdict can be argued with rather than just accepted.
+# =============================================================================
+
+function Invoke-WgExtraChecks {
+
+    # ── Pre-boot authentication: the BitLocker question that actually matters ─
+    Write-WgBanner 'POSTURE - STRG: BitLocker pre-boot authentication' @(
+        'https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/countermeasures'
+    )
+
+    if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+        $vols = $null
+        try { $vols = @(Get-BitLockerVolume -ErrorAction Stop) } catch { $vols = $null }
+        if (-not $vols) {
+            if (-not $script:IsAdmin) {
+                $script:Counts.PRIV_SKIP++
+                Add-WgResult -Status 'SKIP' -Id 'HRD-STRG-5' -Title 'BitLocker pre-boot authentication' `
+                    -Category 'STRG' -Severity 'High' `
+                    -Description 'ADMINISTRATOR REQUIRED - BitLocker key protectors cannot be read unelevated.' `
+                    -Remediation 'Re-run from an elevated prompt'
+            } else {
+                Add-WgResult -Status 'WARN' -Id 'HRD-STRG-5' -Title 'BitLocker pre-boot authentication' `
+                    -Category 'STRG' -Severity 'High' `
+                    -Description 'BitLocker volume information could not be read; the feature may not be installed.'
+            }
+        } else {
+            $sysVols = @($vols | Where-Object {
+                $_.VolumeType -eq 'OperatingSystem' -or $_.MountPoint -eq $env:SystemDrive })
+            if ($sysVols.Count -eq 0) { $sysVols = @($vols | Select-Object -First 1) }
+
+            foreach ($v in $sysVols) {
+                $on = ("$($v.ProtectionStatus)" -eq 'On' -or "$($v.ProtectionStatus)" -eq '1')
+                if (-not $on) { continue }   # HRD-STRG-1 already reports an unprotected volume
+
+                $types = @($v.KeyProtector | ForEach-Object { "$($_.KeyProtectorType)" })
+                # Something the user knows, or something they carry, in addition to the TPM.
+                $strong = @($types | Where-Object {
+                    $_ -match '^(TpmPin|TpmPinStartupKey|Pin|Password|PassPhrase)$' })
+                # A USB startup key counts, but it travels with the laptop it unlocks.
+                $removable = @($types | Where-Object {
+                    $_ -match '^(TpmStartupKey|ExternalKey|StartupKey)$' })
+                $tpmOnly = (@($types | Where-Object { $_ -eq 'Tpm' }).Count -gt 0 -and
+                            $strong.Count -eq 0 -and $removable.Count -eq 0)
+
+                $shown = if ($types.Count) { $types -join ', ' } else { '(none reported)' }
+
+                if ($strong.Count -gt 0) {
+                    Add-WgResult -Status 'PASS' -Id 'HRD-STRG-5' `
+                        -Title 'BitLocker pre-boot authentication' -Category 'STRG' -Severity 'High' `
+                        -Description ("$($v.MountPoint) requires pre-boot authentication. " +
+                                      "Key protectors: $shown.")
+                } elseif ($tpmOnly) {
+                    Add-WgResult -Status 'FAIL' -Id 'HRD-STRG-5' `
+                        -Title 'BitLocker pre-boot authentication' -Category 'STRG' -Severity 'High' `
+                        -Description ("$($v.MountPoint) is protected by the TPM alone (protectors: $shown). " +
+                                      'TPM-only BitLocker unlocks the disk before anyone authenticates, so ' +
+                                      'it does not defend against an attacker with the powered-off machine: ' +
+                                      'the key can be recovered by sniffing the LPC/SPI bus or via a DMA or ' +
+                                      'boot-order attack. It protects against a stolen bare disk, and little else.') `
+                        -Remediation ("Add-BitLockerKeyProtector -MountPoint $($v.MountPoint) " +
+                                      '-TpmAndPinProtector  (and enable the "Require additional authentication ' +
+                                      'at startup" policy)')
+                } elseif ($removable.Count -gt 0) {
+                    Add-WgResult -Status 'WARN' -Id 'HRD-STRG-5' `
+                        -Title 'BitLocker pre-boot authentication' -Category 'STRG' -Severity 'High' `
+                        -Description ("$($v.MountPoint) unlocks with a startup key rather than a PIN " +
+                                      "(protectors: $shown). Better than TPM-only, but a USB key stored " +
+                                      'with the machine it unlocks is no protection at all.') `
+                        -Remediation ("Prefer a TPM+PIN protector: Add-BitLockerKeyProtector " +
+                                      "-MountPoint $($v.MountPoint) -TpmAndPinProtector")
+                } else {
+                    Add-WgResult -Status 'WARN' -Id 'HRD-STRG-5' `
+                        -Title 'BitLocker pre-boot authentication' -Category 'STRG' -Severity 'High' `
+                        -Description ("$($v.MountPoint) is protected, but the protector set could not be " +
+                                      "classified: $shown. Verify pre-boot authentication manually.")
+                }
+            }
+        }
+    } else {
+        Add-WgResult -Status 'SKIP' -Id 'HRD-STRG-5' -Title 'BitLocker pre-boot authentication' `
+            -Category 'STRG' -Severity 'High' -Description 'The BitLocker module is not available on this host.'
+    }
+
+    # ── Writable %PATH% directories: DLL search-order hijacking ──────────────
+    Write-WgBanner 'POSTURE - SCHD: writable directories on the system PATH' @(
+        'https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order'
+    )
+
+    # Well-known SIDs rather than account names: a name comparison silently
+    # finds nothing on a non-English Windows, which is the usual way this check
+    # is written and the usual reason it reports a clean result on a bad host.
+    $broadSids = @{
+        'S-1-5-32-545' = 'Users'
+        'S-1-1-0'      = 'Everyone'
+        'S-1-5-11'     = 'Authenticated Users'
+        'S-1-5-32-546' = 'Guests'
+        'S-1-5-7'      = 'Anonymous Logon'
+    }
+
+    $writeMask = [System.Security.AccessControl.FileSystemRights]::Write -bor
+                 [System.Security.AccessControl.FileSystemRights]::CreateFiles -bor
+                 [System.Security.AccessControl.FileSystemRights]::AppendData -bor
+                 [System.Security.AccessControl.FileSystemRights]::WriteData -bor
+                 [System.Security.AccessControl.FileSystemRights]::Modify -bor
+                 [System.Security.AccessControl.FileSystemRights]::FullControl -bor
+                 [System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor
+                 [System.Security.AccessControl.FileSystemRights]::ChangePermissions
+
+    # The machine PATH, not the process PATH: a user-scoped entry is not a
+    # system-wide hijack and would produce a finding on every host.
+    $machinePath = Get-WgRegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' 'Path'
+    if (-not $machinePath) { $machinePath = $env:Path }
+
+    $pathBad = @(); $pathOk = 0; $pathMissing = 0
+    foreach ($raw in ("$machinePath" -split ';')) {
+        $folder = "$raw".Trim().Trim('"')
+        if (-not $folder) { continue }
+        try { $folder = [System.Environment]::ExpandEnvironmentVariables($folder) } catch { }
+        if (-not (Test-Path -LiteralPath $folder -PathType Container)) { $pathMissing++; continue }
+        try {
+            $acl = Get-Acl -LiteralPath $folder -ErrorAction Stop
+            $hits = @()
+            foreach ($ace in $acl.Access) {
+                if ($ace.AccessControlType -ne 'Allow') { continue }
+                if (-not ($ace.FileSystemRights -band $writeMask)) { continue }
+                $sid = $null
+                try {
+                    $sid = if ($ace.IdentityReference -is [System.Security.Principal.SecurityIdentifier]) {
+                        $ace.IdentityReference.Value
+                    } else {
+                        $ace.IdentityReference.Translate(
+                            [System.Security.Principal.SecurityIdentifier]).Value
+                    }
+                } catch { $sid = $null }
+                if ($sid -and $broadSids.ContainsKey($sid)) { $hits += $broadSids[$sid] }
+            }
+            if ($hits.Count -gt 0) {
+                $pathBad += ("{0} (writable by {1})" -f $folder, (($hits | Sort-Object -Unique) -join ', '))
+            } else { $pathOk++ }
+        } catch { }
+    }
+
+    if ($pathBad.Count -gt 0) {
+        Add-WgResult -Status 'FAIL' -Id 'HRD-SCHD-4' `
+            -Title 'No system PATH directory is writable by unprivileged users' -Category 'SCHD' `
+            -Severity 'High' `
+            -Description ("$($pathBad.Count) of $($pathBad.Count + $pathOk) directories on the machine " +
+                          'PATH grant write access to a broad group: ' +
+                          (($pathBad | Select-Object -First 6) -join '; ') +
+                          '. Any process that resolves a DLL by name can be made to load an attacker ' +
+                          'DLL planted there, which escalates to whatever account runs that process.') `
+            -Remediation 'Remove write access for Users/Everyone/Authenticated Users, or take the directory off the machine PATH'
+    } else {
+        Add-WgResult -Status 'PASS' -Id 'HRD-SCHD-4' `
+            -Title 'No system PATH directory is writable by unprivileged users' -Category 'SCHD' `
+            -Severity 'High' `
+            -Description ("All $pathOk readable directories on the machine PATH deny write access to " +
+                          'Users, Everyone and Authenticated Users' +
+                          $(if ($pathMissing) { " ($pathMissing PATH entries do not exist)" } else { '' }) + '.')
+    }
+
+    # ── Application control: deployed is not the same as enforced ────────────
+    Write-WgBanner 'POSTURE - TOOL: application control enforcement' @(
+        'https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/appcontrol'
+        'https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/design/applocker-policy-use-scenarios'
+    )
+
+    $dgw = Get-WgWmi -Class Win32_DeviceGuard -Namespace 'root\Microsoft\Windows\DeviceGuard'
+    if ($dgw) {
+        # 0 = off, 1 = audit only, 2 = enforced
+        foreach ($ci in @(
+            @{ Id = 'HRD-TOOL-4'; P = 'CodeIntegrityPolicyEnforcementStatus';         L = 'Kernel-mode' },
+            @{ Id = 'HRD-TOOL-5'; P = 'UsermodeCodeIntegrityPolicyEnforcementStatus'; L = 'User-mode' })) {
+            $v = "$($dgw.($ci.P))"
+            switch ($v) {
+                '2' {
+                    Add-WgResult -Status 'PASS' -Id $ci.Id `
+                        -Title "WDAC $($ci.L) code integrity is enforced" -Category 'TOOL' -Severity 'Medium' `
+                        -Description "$($ci.P) is 2 (enforced)."
+                }
+                '1' {
+                    Add-WgResult -Status 'WARN' -Id $ci.Id `
+                        -Title "WDAC $($ci.L) code integrity is enforced" -Category 'TOOL' -Severity 'Medium' `
+                        -Description ("$($ci.P) is 1 - the policy is in AUDIT mode. It logs what it would " +
+                                      'have blocked and blocks nothing, so it provides visibility but no ' +
+                                      'protection. This is the state a deployment gets stuck in.') `
+                        -Remediation 'Remove the audit-mode option from the WDAC policy and redeploy to enforce it'
+                }
+                '0' {
+                    Add-WgResult -Status 'WARN' -Id $ci.Id `
+                        -Title "WDAC $($ci.L) code integrity is enforced" -Category 'TOOL' -Severity 'Medium' `
+                        -Description "$($ci.P) is 0 - no WDAC policy is enforcing $($ci.L.ToLower()) code integrity." `
+                        -Remediation 'Deploy an App Control for Business (WDAC) policy in audit mode, then enforce it'
+                }
+                default {
+                    Add-WgResult -Status 'INFO' -Id $ci.Id `
+                        -Title "WDAC $($ci.L) code integrity is enforced" -Category 'TOOL' -Severity 'Medium' `
+                        -Description "$($ci.P) reported '$v', which this build does not recognise."
+                }
+            }
+        }
+    } else {
+        # Emit both IDs, so a host without Device Guard still reports the same
+        # check set and -Baseline does not read them as checks that disappeared.
+        foreach ($ci in @(
+            @{ Id = 'HRD-TOOL-4'; L = 'Kernel-mode' },
+            @{ Id = 'HRD-TOOL-5'; L = 'User-mode' })) {
+            Add-WgResult -Status 'SKIP' -Id $ci.Id `
+                -Title "WDAC $($ci.L) code integrity is enforced" -Category 'TOOL' -Severity 'Medium' `
+                -Description 'Win32_DeviceGuard is not present (Windows Server 2016 and later only).'
+        }
+    }
+
+    # AppLocker: a policy with a stopped Application Identity service enforces nothing.
+    $appIdStart   = Get-WgServiceStart 'AppIDSvc'
+    $appIdRunning = Test-WgServiceRunning 'AppIDSvc'
+    $hasAppLocker = $false
+    try {
+        $hasAppLocker = @(Get-ChildItem 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\SrpV2' -ErrorAction Stop).Count -gt 0
+    } catch { }
+
+    if ($hasAppLocker -and $appIdRunning) {
+        Add-WgResult -Status 'PASS' -Id 'HRD-TOOL-6' -Title 'AppLocker policy is actually being enforced' `
+            -Category 'TOOL' -Severity 'Medium' `
+            -Description 'An AppLocker policy is present and the Application Identity service is running.'
+    } elseif ($hasAppLocker -and -not $appIdRunning) {
+        Add-WgResult -Status 'FAIL' -Id 'HRD-TOOL-6' -Title 'AppLocker policy is actually being enforced' `
+            -Category 'TOOL' -Severity 'High' `
+            -Description ('An AppLocker policy is deployed, but the Application Identity service ' +
+                          "(AppIDSvc) is not running (start type: $(if ($appIdStart) { $appIdStart } else { 'not installed' })). " +
+                          'AppLocker rules are evaluated by that service, so the policy is enforcing ' +
+                          'nothing at all - the worst case, because the host looks protected.') `
+            -Remediation 'Set-Service AppIDSvc -StartupType Automatic; Start-Service AppIDSvc (deploy via GPO so it survives a reboot)'
+    } else {
+        Add-WgResult -Status 'INFO' -Id 'HRD-TOOL-6' -Title 'AppLocker policy is actually being enforced' `
+            -Category 'TOOL' -Severity 'Low' `
+            -Description ('No AppLocker policy is present. ' +
+                          'HRD-TOOL-3 reports on application control generally; WDAC is the ' +
+                          'better choice on current Windows.')
+    }
+
+    # ── PowerShell language mode, judged in context ──────────────────────────
+    Write-WgBanner 'POSTURE - SHLL: PowerShell language mode' @(
+        'https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_language_modes'
+    )
+
+    $lm = "$($ExecutionContext.SessionState.LanguageMode)"
+    $appControlEnforced = ($hasAppLocker -and $appIdRunning) -or
+                          ("$($dgw.UsermodeCodeIntegrityPolicyEnforcementStatus)" -eq '2')
+    if ($lm -ne 'FullLanguage') {
+        Add-WgResult -Status 'PASS' -Id 'HRD-SHLL-3' -Title 'PowerShell language mode' -Category 'SHLL' `
+            -Severity 'Medium' `
+            -Description ("This session runs in $lm, which blocks arbitrary .NET and Win32 calls - " +
+                          'the mechanism most PowerShell tradecraft depends on.')
+    } elseif ($appControlEnforced) {
+        Add-WgResult -Status 'FAIL' -Id 'HRD-SHLL-3' -Title 'PowerShell language mode' -Category 'SHLL' `
+            -Severity 'High' `
+            -Description ('This session runs in FullLanguage even though application control is ' +
+                          'enforced on this host. Under an enforced WDAC or AppLocker policy PowerShell ' +
+                          'should drop to ConstrainedLanguage, so FullLanguage means the policy does not ' +
+                          'cover PowerShell and the application control can be bypassed through it.') `
+            -Remediation 'Ensure the WDAC/AppLocker policy covers scripts and PowerShell, so it enters ConstrainedLanguage'
+    } else {
+        Add-WgResult -Status 'INFO' -Id 'HRD-SHLL-3' -Title 'PowerShell language mode' -Category 'SHLL' `
+            -Severity 'Low' `
+            -Description ('This session runs in FullLanguage. That is the Windows default and is not a ' +
+                          'finding on its own - ConstrainedLanguage is a consequence of enforced ' +
+                          'application control, not a setting to apply by itself. It is reported here ' +
+                          'because it tells you PowerShell is unconstrained on this host.')
+    }
+
+    # ── Driver co-installers ─────────────────────────────────────────────────
+    Write-WgBanner 'POSTURE - KRNL: driver co-installers & DMA policy' @(
+        'https://learn.microsoft.com/en-us/windows-hardware/drivers/install/registering-a-device-specific-co-installer'
+        'https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-dataprotection'
+    )
+
+    $coLegacy = Get-WgRegValue 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Installer' 'DisableCoInstallers'
+    $coPolicy = Get-WgRegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Settings' 'DisableCoInstallers'
+    $coOff = ("$coLegacy" -eq '1' -or "$coPolicy" -eq '1')
+    Add-WgResult -Status $(if ($coOff) { 'PASS' } else { 'WARN' }) -Id 'HRD-KRNL-8' `
+        -Title 'Driver co-installers are disabled' -Category 'KRNL' -Severity 'Medium' `
+        -Description $(if ($coOff) {
+            'DisableCoInstallers is set, so vendor co-installers do not run during device installation.'
+        } else {
+            ('DisableCoInstallers is not set' +
+             $(if ($null -ne $coLegacy -or $null -ne $coPolicy) {
+                 " (legacy=$(if ($null -eq $coLegacy) { 'absent' } else { $coLegacy })" +
+                 ", policy=$(if ($null -eq $coPolicy) { 'absent' } else { $coPolicy }))"
+               } else { '' }) +
+             '. A co-installer is vendor code that Plug and Play executes as SYSTEM when a device is ' +
+             'attached, so plugging in hardware can run arbitrary software outside your application control.')
+        }) `
+        -Remediation $(if ($coOff) { '' } else {
+            "New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Settings' " +
+            '-Name DisableCoInstallers -PropertyType DWord -Value 1 -Force' })
+
+    # The DataProtection CSP key, which is a different control from the
+    # DmaSecurity\AllowDmaUnderLock value checked by HRD-KRNL-6.
+    $dmaPolicy = Get-WgRegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceLock' 'AllowDirectMemoryAccess'
+    Add-WgResult -Status $(if ("$dmaPolicy" -eq '0') { 'PASS' } else { 'WARN' }) -Id 'HRD-KRNL-9' `
+        -Title 'Direct memory access is blocked while the host is locked' -Category 'KRNL' -Severity 'High' `
+        -Description $(if ("$dmaPolicy" -eq '0') {
+            'AllowDirectMemoryAccess is 0, so DMA-capable devices are blocked while the console is locked.'
+        } else {
+            ('AllowDirectMemoryAccess is ' +
+             $(if ($null -eq $dmaPolicy) { 'not configured, which leaves the permissive default' } else { "$dmaPolicy" }) +
+             '. With an external PCIe or Thunderbolt port, a DMA-capable device can read system memory - ' +
+             'including BitLocker keys - without unlocking the machine. This is the DataProtection ' +
+             'policy; HRD-KRNL-6 covers the separate DmaSecurity value.')
+        }) `
+        -Remediation $(if ("$dmaPolicy" -eq '0') { '' } else {
+            "New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeviceLock' " +
+            '-Name AllowDirectMemoryAccess -PropertyType DWord -Value 0 -Force' })
+
+    $hvciLock = Get-WgRegValue 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity' 'LockConfiguration'
+    Add-WgResult -Status $(if ("$hvciLock" -eq '1') { 'PASS' } else { 'WARN' }) -Id 'HRD-KRNL-10' `
+        -Title 'HVCI configuration is locked against local changes' -Category 'KRNL' -Severity 'Medium' `
+        -Description $(if ("$hvciLock" -eq '1') {
+            'LockConfiguration is 1, so HVCI cannot be turned off without physical presence at the firmware.'
+        } else {
+            ('HVCI LockConfiguration is ' +
+             $(if ($null -eq $hvciLock) { 'not set' } else { "$hvciLock" }) +
+             '. Without the UEFI lock, an attacker who gains administrator rights can disable memory ' +
+             'integrity with a registry write and a reboot, which removes the protection silently.')
+        }) `
+        -Remediation $(if ("$hvciLock" -eq '1') { '' } else {
+            'Set "Virtualization Based Protection of Code Integrity" to "Enabled with UEFI lock" by Group Policy' })
+
+    # ── AlwaysInstallElevated: exploitable only when BOTH hives are set ──────
+    Write-WgBanner 'POSTURE - INSE: AlwaysInstallElevated (both hives)' @(
+        'https://learn.microsoft.com/en-us/windows/win32/msi/alwaysinstallelevated'
+    )
+
+    $aieM = Get-WgRegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\Installer' 'AlwaysInstallElevated'
+    $aieU = Get-WgRegValue 'HKCU:\SOFTWARE\Policies\Microsoft\Windows\Installer' 'AlwaysInstallElevated'
+    if ("$aieM" -eq '1' -and "$aieU" -eq '1') {
+        Add-WgResult -Status 'FAIL' -Id 'HRD-INSE-31' -Title 'AlwaysInstallElevated is not exploitable' `
+            -Category 'INSE' -Severity 'High' `
+            -Description ('AlwaysInstallElevated is 1 in BOTH HKLM and HKCU, which is the exploitable ' +
+                          'combination: any user can install an MSI of their choosing as SYSTEM. This is ' +
+                          'a direct, reliable local privilege escalation.') `
+            -Remediation ('Set AlwaysInstallElevated to 0 (or remove it) under ' +
+                          'HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer and the HKCU equivalent')
+    } elseif ("$aieM" -eq '1' -or "$aieU" -eq '1') {
+        Add-WgResult -Status 'WARN' -Id 'HRD-INSE-31' -Title 'AlwaysInstallElevated is not exploitable' `
+            -Category 'INSE' -Severity 'Medium' `
+            -Description ('AlwaysInstallElevated is set in only one hive ' +
+                          "(HKLM=$(if ($null -eq $aieM) { 'absent' } else { $aieM }), " +
+                          "HKCU=$(if ($null -eq $aieU) { 'absent' } else { $aieU })). " +
+                          'Both are required for the privilege escalation, so this is not currently ' +
+                          'exploitable - but it is one policy change away, and the HKCU value read here ' +
+                          'is only that of the account running the scan.') `
+            -Remediation 'Clear the remaining AlwaysInstallElevated value so the policy cannot be completed'
+    } else {
+        Add-WgResult -Status 'PASS' -Id 'HRD-INSE-31' -Title 'AlwaysInstallElevated is not exploitable' `
+            -Category 'INSE' -Severity 'High' `
+            -Description 'AlwaysInstallElevated is not enabled in either HKLM or HKCU.'
+    }
+
+    # ── IPv6 binding: reported, deliberately not failed ─────────────────────
+    Write-WgBanner 'POSTURE - INSE: IPv6 binding (mitm6 exposure)' @(
+        'https://blog.fox-it.com/2018/01/11/mitm6-compromising-ipv4-networks-via-ipv6/'
+        'https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/configure-ipv6-in-windows'
+    )
+
+    $v6 = $null
+    if (Get-Command Get-NetAdapterBinding -ErrorAction SilentlyContinue) {
+        try {
+            $v6 = @(Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction Stop)
+        } catch { $v6 = $null }
+    }
+    if (-not $v6) {
+        Add-WgResult -Status 'SKIP' -Id 'HRD-INSE-32' -Title 'IPv6 binding and mitm6 exposure' `
+            -Category 'INSE' -Severity 'Low' `
+            -Description ('Adapter bindings could not be enumerated (Get-NetAdapterBinding is ' +
+                          'unavailable or returned nothing on this host).')
+    } else {
+        if ($v6) {
+            $on = @($v6 | Where-Object { $_.Enabled })
+            Add-WgResult -Status 'INFO' -Id 'HRD-INSE-32' -Title 'IPv6 binding and mitm6 exposure' `
+                -Category 'INSE' -Severity 'Low' `
+                -Description ("IPv6 is bound on $($on.Count) of $($v6.Count) adapter(s)" +
+                              $(if ($on.Count) { ': ' + ((@($on) | Select-Object -First 5 | ForEach-Object { $_.Name }) -join ', ') } else { '' }) +
+                              '. This is reported, not failed: mitm6 abuses rogue DHCPv6/RA on the wire, ' +
+                              'and Microsoft does not support disabling IPv6 - doing so breaks components ' +
+                              'that assume it. Mitigate on the network with RA Guard and DHCPv6 Guard, ' +
+                              'and by setting the WPAD entry to deny. Disable the binding only where you ' +
+                              'have confirmed nothing on the host needs it.')
+        }
+    }
+
+    # ── Recall / Windows AI ──────────────────────────────────────────────────
+    Write-WgBanner 'POSTURE - STRG: Recall / Windows AI data' @(
+        'https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-windowsai'
+        'https://support.microsoft.com/en-us/windows/privacy-and-control-over-your-recall-experience-d404f672-7647-41e5-886c-a3c59680af15'
+    )
+
+    $recallMachine = Get-WgRegValue 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis'
+    $hives = Get-WgUserHives
+    $userUnset = @()
+    foreach ($hv in $hives) {
+        $v = Get-WgRegValue "$($hv.Path)\Software\Policies\Microsoft\Windows\WindowsAI" 'DisableAIDataAnalysis'
+        if ("$v" -ne '1') { $userUnset += $hv.Name }
+    }
+
+    if ("$recallMachine" -eq '1') {
+        Add-WgResult -Status 'PASS' -Id 'HRD-STRG-6' -Title 'Recall (Windows AI) snapshotting is disabled by policy' `
+            -Category 'STRG' -Severity 'Medium' `
+            -Description ('DisableAIDataAnalysis is 1 machine-wide, so Recall cannot capture screen ' +
+                          'snapshots on this host.')
+    } else {
+        Add-WgResult -Status 'WARN' -Id 'HRD-STRG-6' -Title 'Recall (Windows AI) snapshotting is disabled by policy' `
+            -Category 'STRG' -Severity 'Medium' `
+            -Description ('DisableAIDataAnalysis is not set machine-wide' +
+                          $(if ($userUnset.Count) { ", and is also unset for: $(($userUnset | Select-Object -First 5) -join ', ')" } else { '' }) +
+                          '. Recall ships only on Copilot+ hardware and does not exist on Server, so this ' +
+                          'is usually not exploitable here - but the policy is the thing that keeps it ' +
+                          'that way if the image is ever reused on client hardware. Where Recall does run, ' +
+                          'it writes a local, unencrypted-at-rest index of everything on screen.') `
+            -Remediation ("New-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI' " +
+                          '-Name DisableAIDataAnalysis -PropertyType DWord -Value 1 -Force')
+    }
+
+    # On-disk artefacts: proof it actually ran, regardless of current policy
+    $recallHits = @()
+    try {
+        $userRoot = Join-Path $env:SystemDrive 'Users'
+        if (Test-Path -LiteralPath $userRoot) {
+            foreach ($u in @(Get-ChildItem -LiteralPath $userRoot -Directory -ErrorAction SilentlyContinue)) {
+                $base = Join-Path $u.FullName 'AppData\Local\CoreAIPlatform.00\UKP'
+                if (-not (Test-Path -LiteralPath $base)) { continue }
+                foreach ($g in @(Get-ChildItem -LiteralPath $base -Directory -ErrorAction SilentlyContinue)) {
+                    if (Test-Path -LiteralPath (Join-Path $g.FullName 'ukg.db')) {
+                        $recallHits += "$($u.Name): ukg.db"
+                    }
+                    $img = Join-Path $g.FullName 'ImageStore'
+                    if ((Test-Path -LiteralPath $img) -and
+                        @(Get-ChildItem -LiteralPath $img -ErrorAction SilentlyContinue).Count -gt 0) {
+                        $recallHits += "$($u.Name): ImageStore with content"
+                    }
+                }
+            }
+        }
+    } catch { }
+
+    if ($recallHits.Count -gt 0) {
+        Add-WgResult -Status 'FAIL' -Id 'HRD-STRG-7' -Title 'No Recall snapshot data is present on disk' `
+            -Category 'STRG' -Severity 'High' `
+            -Description ("Recall artefacts were found for $($recallHits.Count) profile path(s): " +
+                          (($recallHits | Select-Object -First 6) -join '; ') +
+                          '. The database and image store hold plaintext-readable screen captures, ' +
+                          'available to anything running as that user, so they are a credential and ' +
+                          'data-exposure problem independent of whether Recall is enabled now.') `
+            -Remediation ('Disable Recall by policy, then delete %LOCALAPPDATA%\CoreAIPlatform.00\UKP ' +
+                          'for each affected profile')
+    } else {
+        Add-WgResult -Status 'PASS' -Id 'HRD-STRG-7' -Title 'No Recall snapshot data is present on disk' `
+            -Category 'STRG' -Severity 'High' `
+            -Description 'No Recall database or image store was found in any user profile on this host.'
+    }
+
+    # ── Installed software inventory ─────────────────────────────────────────
+    Write-WgBanner 'POSTURE - PKGS: installed software inventory'
+
+    $sw = @{}
+    foreach ($root in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')) {
+        try {
+            foreach ($k in @(Get-ChildItem -LiteralPath $root -ErrorAction Stop)) {
+                $n = Get-WgRegValue $k.PSPath 'DisplayName'
+                if (-not $n) { continue }
+                $ver = Get-WgRegValue $k.PSPath 'DisplayVersion'
+                $sw["$n"] = "$ver"
+            }
+        } catch { }
+    }
+    if ($sw.Count -gt 0) {
+        $listed = @($sw.Keys | Sort-Object | Select-Object -First 25 |
+            ForEach-Object { if ($sw[$_]) { "$_ $($sw[$_])" } else { "$_" } })
+        Add-WgResult -Status 'INFO' -Id 'HRD-PKGS-3' -Title 'Installed software inventory' `
+            -Category 'PKGS' -Severity 'Low' `
+            -Description ("$($sw.Count) machine-wide product(s) are registered. " +
+                          "First $($listed.Count) by name: " + ($listed -join '; ') +
+                          '. The full list is in the CSV report. Review it for unsupported, ' +
+                          'unmanaged or end-of-life software - an audit of the OS says nothing ' +
+                          'about the things running on it.')
+    } else {
+        Add-WgResult -Status 'INFO' -Id 'HRD-PKGS-3' -Title 'Installed software inventory' `
+            -Category 'PKGS' -Severity 'Low' `
+            -Description 'No machine-wide installed products could be enumerated from the uninstall keys.'
+    }
+
+    # ── Domain password policy ───────────────────────────────────────────────
+    # The local security policy that the account-policy benchmark rows read is
+    # NOT the policy that governs domain accounts: for a domain-joined host the
+    # Default Domain Policy at the DC is what applies. On a domain controller
+    # that is local information. Anywhere else, reading it means talking to a
+    # DC over the network, which this tool does not do unless asked, so it is
+    # behind -IncludeDomainPolicy.
+    if ($script:IsDC -or $script:IncludeDomainPol) {
+        Write-WgBanner 'POSTURE - AUTH: domain password & lockout policy' @(
+            'https://learn.microsoft.com/en-us/windows/security/threat-protection/security-policy-settings/password-policy'
+            'https://learn.microsoft.com/en-us/entra/identity/authentication/concept-password-ban-bad'
+        )
+
+        $pol = $null
+        $why = ''
+        try {
+            if (Get-Command Get-ADDefaultDomainPasswordPolicy -ErrorAction SilentlyContinue) {
+                $pol = Get-ADDefaultDomainPasswordPolicy -ErrorAction Stop
+            } else {
+                $why = 'the ActiveDirectory module (RSAT) is not installed'
+            }
+        } catch {
+            $why = "the query failed: $($_.Exception.Message)"
+        }
+
+        if (-not $pol) {
+            Add-WgResult -Status 'SKIP' -Id 'HRD-AUTH-13' -Title 'Domain password and lockout policy' `
+                -Category 'AUTH' -Severity 'High' `
+                -Description ("The Default Domain Password Policy could not be read because $why. " +
+                              'The account-policy findings elsewhere in this report describe the LOCAL ' +
+                              'security policy, which does not govern domain accounts.') `
+                -Remediation 'Install RSAT (Install-WindowsFeature RSAT-AD-PowerShell) or run this check on a domain controller'
+        } else {
+            $src = if ($script:IsDC) { 'this domain controller' } else { 'the domain' }
+
+            Add-WgResult -Status $(if ($pol.MinPasswordLength -ge 14) { 'PASS' }
+                                   elseif ($pol.MinPasswordLength -ge 12) { 'WARN' } else { 'FAIL' }) `
+                -Id 'HRD-AUTH-13' -Title 'Domain minimum password length' -Category 'AUTH' -Severity 'High' `
+                -Description ("The Default Domain Policy on $src sets a minimum password length of " +
+                              "$($pol.MinPasswordLength). CIS asks for 14 or more.") `
+                -Remediation $(if ($pol.MinPasswordLength -ge 14) { '' } else {
+                    'Set-ADDefaultDomainPasswordPolicy -Identity <domain> -MinPasswordLength 14' })
+
+            Add-WgResult -Status $(if ($pol.ComplexityEnabled) { 'PASS' } else { 'FAIL' }) `
+                -Id 'HRD-AUTH-14' -Title 'Domain password complexity' -Category 'AUTH' -Severity 'High' `
+                -Description "ComplexityEnabled is $($pol.ComplexityEnabled) on $src." `
+                -Remediation $(if ($pol.ComplexityEnabled) { '' } else {
+                    'Set-ADDefaultDomainPasswordPolicy -Identity <domain> -ComplexityEnabled $true' })
+
+            Add-WgResult -Status $(if (-not $pol.ReversibleEncryptionEnabled) { 'PASS' } else { 'FAIL' }) `
+                -Id 'HRD-AUTH-15' -Title 'Domain reversible password encryption is off' -Category 'AUTH' `
+                -Severity 'High' `
+                -Description ("ReversibleEncryptionEnabled is $($pol.ReversibleEncryptionEnabled) on $src." +
+                              $(if ($pol.ReversibleEncryptionEnabled) {
+                                  ' This stores passwords in a recoverable form, which is equivalent to plaintext.'
+                                } else { '' })) `
+                -Remediation $(if (-not $pol.ReversibleEncryptionEnabled) { '' } else {
+                    'Set-ADDefaultDomainPasswordPolicy -Identity <domain> -ReversibleEncryptionEnabled $false' })
+
+            $lt = [int] $pol.LockoutThreshold
+            Add-WgResult -Status $(if ($lt -gt 0 -and $lt -le 10) { 'PASS' }
+                                   elseif ($lt -eq 0) { 'FAIL' } else { 'WARN' }) `
+                -Id 'HRD-AUTH-16' -Title 'Domain account lockout threshold' -Category 'AUTH' -Severity 'High' `
+                -Description $(if ($lt -eq 0) {
+                    "LockoutThreshold is 0 on $src, so accounts never lock and password spraying is unlimited."
+                } else {
+                    "LockoutThreshold is $lt on $src (CIS asks for 1-10, and not 0)."
+                }) `
+                -Remediation $(if ($lt -gt 0 -and $lt -le 10) { '' } else {
+                    'Set-ADDefaultDomainPasswordPolicy -Identity <domain> -LockoutThreshold 10' })
+
+            $ld = [int] $pol.LockoutDuration.TotalMinutes
+            Add-WgResult -Status $(if ($ld -ge 15 -or $ld -eq 0) { 'PASS' } else { 'WARN' }) `
+                -Id 'HRD-AUTH-17' -Title 'Domain account lockout duration' -Category 'AUTH' -Severity 'Medium' `
+                -Description ("LockoutDuration is $ld minute(s) on $src" +
+                              $(if ($ld -eq 0) { ' (locked until an administrator unlocks, which satisfies the benchmark).' }
+                                else { ' (CIS asks for 15 or more).' })) `
+                -Remediation $(if ($ld -ge 15 -or $ld -eq 0) { '' } else {
+                    'Set-ADDefaultDomainPasswordPolicy -Identity <domain> -LockoutDuration 00:15:00' })
+
+            Add-WgResult -Status 'INFO' -Id 'HRD-AUTH-18' -Title 'Domain password policy detail' `
+                -Category 'AUTH' -Severity 'Low' `
+                -Description ("History $($pol.PasswordHistoryCount), min age " +
+                              "$([int] $pol.MinPasswordAge.TotalDays)d, max age " +
+                              "$([int] $pol.MaxPasswordAge.TotalDays)d, lockout observation window " +
+                              "$([int] $pol.LockoutObservationWindow.TotalMinutes)min. Note that a " +
+                              'fine-grained password policy (PSO) can override all of this for specific ' +
+                              'users or groups - check Get-ADFineGrainedPasswordPolicy as well.')
+        }
     }
 }
 
@@ -4576,6 +5262,87 @@ function ft(){
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CONSOLE SUMMARY TABLE
+# A ~940-check run cannot print one row per check and stay readable, so this
+# aggregates to one row per category and then lists only what needs acting on.
+# Colour follows the convention the team already reads:
+#   green = OK, magenta = might be a finding, red = bad, yellow = could not test
+# ─────────────────────────────────────────────────────────────────────────────
+function Write-WgSummaryTable {
+    if ($script:Results.Count -eq 0) { return }
+
+    Write-Host ''
+    Write-Host '  ###########################################################################' -ForegroundColor DarkCyan
+    Write-Host '  #  Results by category                                                    #' -ForegroundColor DarkCyan
+    Write-Host '  ###########################################################################' -ForegroundColor DarkCyan
+    Write-Host ''
+    Write-Host ('  {0,-34} {1,-16} {2,5} {3,6} {4,5} {5,5} {6,5}' -f
+        'Category', 'Framework', 'OK', 'MAYBE', 'BAD', 'INFO', 'N/T') -ForegroundColor White
+    Write-Host ('  ' + ('-' * 82)) -ForegroundColor DarkGray
+
+    $groups = $script:Results |
+        Group-Object -Property { "$($_.framework)`u{241F}$($_.category)" } |
+        Sort-Object Name
+    foreach ($g in $groups) {
+        $parts = $g.Name -split "`u{241F}"
+        $fw  = $parts[0]
+        $cat = if ($parts.Count -gt 1) { $parts[1] } else { '' }
+        $ok    = @($g.Group | Where-Object { $_.status -eq 'PASS' }).Count
+        $maybe = @($g.Group | Where-Object { $_.status -eq 'WARN' }).Count
+        $bad   = @($g.Group | Where-Object { $_.status -eq 'FAIL' }).Count
+        $info  = @($g.Group | Where-Object { $_.status -eq 'INFO' -or $_.status -eq 'WAIVED' }).Count
+        $nt    = @($g.Group | Where-Object { $_.status -eq 'SKIP' }).Count
+
+        # Row colour reflects the worst thing in it
+        $colour = if ($bad -gt 0) { 'Red' } elseif ($maybe -gt 0) { 'Magenta' }
+                  elseif ($ok -gt 0) { 'Green' } elseif ($nt -gt 0) { 'Yellow' } else { 'Gray' }
+        if ($cat.Length -gt 34) { $cat = $cat.Substring(0, 31) + '...' }
+        Write-Host ('  {0,-34} {1,-16} {2,5} {3,6} {4,5} {5,5} {6,5}' -f
+            $cat, $fw, $ok, $maybe, $bad, $info, $nt) -ForegroundColor $colour
+    }
+
+    # ── What to act on ──────────────────────────────────────────────────────
+    $act = @($script:Results | Where-Object { $_.status -eq 'FAIL' -or $_.status -eq 'WARN' })
+    if ($act.Count -eq 0) {
+        Write-Host ''
+        Write-Host '  Nothing failed and nothing warned. Open the HTML report for the detail.' -ForegroundColor Green
+        return
+    }
+
+    $sevRank = @{ 'High' = 0; 'Medium' = 1; 'Low' = 2 }
+    $ordered = $act |
+        Sort-Object @{ Expression = { if ($_.status -eq 'FAIL') { 0 } else { 1 } } },
+                    @{ Expression = { $sevRank["$($_.severity)"] } },
+                    @{ Expression = { $_.id } }
+    $cap  = 40
+    $show = @($ordered | Select-Object -First $cap)
+
+    Write-Host ''
+    Write-Host '  ###########################################################################' -ForegroundColor DarkCyan
+    Write-Host '  #  Findings to act on, worst first                                        #' -ForegroundColor DarkCyan
+    Write-Host '  ###########################################################################' -ForegroundColor DarkCyan
+    Write-Host ''
+    Write-Host ('  {0,-6} {1,-8} {2,-22} {3}' -f 'RESULT', 'SEVERITY', 'CHECK', 'FINDING') -ForegroundColor White
+    Write-Host ('  ' + ('-' * 100)) -ForegroundColor DarkGray
+
+    foreach ($r in $show) {
+        $label  = if ($r.status -eq 'FAIL') { 'BAD' } else { 'MAYBE' }
+        $colour = if ($r.status -eq 'FAIL') { 'Red' } else { 'Magenta' }
+        $title  = "$($r.title)"
+        if ($title.Length -gt 62) { $title = $title.Substring(0, 59) + '...' }
+        $id = "$($r.id)"
+        if ($id.Length -gt 22) { $id = $id.Substring(0, 19) + '...' }
+        Write-Host ('  {0,-6} {1,-8} {2,-22} {3}' -f $label, $r.severity, $id, $title) -ForegroundColor $colour
+    }
+
+    if ($ordered.Count -gt $cap) {
+        Write-Host ''
+        Write-Host ("  ... and $($ordered.Count - $cap) more. The full list, with the exact fix for each, " +
+                    'is in the HTML and CSV reports.') -ForegroundColor DarkGray
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TRANSFER BUNDLE - for carrying results off the enclave (sneakernet).
 # Produces a .zip with the reports, a MANIFEST and SHA256SUMS, and prints the
 # bundle's own hash to record in the media transfer log.
@@ -4780,6 +5547,9 @@ function Invoke-WgPreflight {
     Write-WgLog "As admin   : $($script:IsAdmin)"
     Write-WgLog "Output     : $($script:OutputDir)"
     Write-WgLog "SHA-256    : $($script:ScriptSha)"
+    if ($script:IncludeDomainPol -and -not $script:IsDC) {
+        Write-WgLog 'Domain pol : enabled - this makes ONE LDAP query to the host''s own domain controller'
+    }
     if ($script:WaiverMap.Count -gt 0) {
         Write-WgLog "Waivers    : $($script:WaiverMap.Count) loaded from $($script:WaiverPath)"
     }
@@ -4813,7 +5583,7 @@ function Invoke-WgMain {
         'cis'      { if ($benchmarksAvailable) { Invoke-WgCisChecks } }
         'stig'     { if ($benchmarksAvailable) { Invoke-WgStigChecks } }
         'baseline' { if ($benchmarksAvailable) { Invoke-WgBaselineChecks } }
-        'posture'  { Invoke-WgPostureChecks }
+        'posture'  { Invoke-WgPostureChecks; Invoke-WgExtraChecks }
         'airgap'   { Invoke-WgAirgapChecks }
         'all' {
             if ($benchmarksAvailable) {
@@ -4822,6 +5592,7 @@ function Invoke-WgMain {
                 Invoke-WgBaselineChecks
             }
             Invoke-WgPostureChecks
+            Invoke-WgExtraChecks
             Invoke-WgAirgapChecks
         }
     }
@@ -4837,6 +5608,8 @@ function Invoke-WgMain {
     Get-WgDrift $script:BaselinePath
 
     # ── Summary (always printed, even with -Quiet) ───────────────────────────
+    Write-WgSummaryTable
+
     $pct     = Get-WgCompliancePct
     $elapsed = [int] ((Get-Date) - $script:StartTime).TotalSeconds
     $c       = $script:Counts
@@ -4931,5 +5704,6 @@ $script:MaxSigAge          = $MaxSignatureAge
 $script:MakeBundle         = [bool] $Bundle
 $script:StrictMode         = [bool] $Strict
 $script:IncludeManualRules = [bool] $IncludeManual
+$script:IncludeDomainPol   = [bool] $IncludeDomainPolicy
 
 Invoke-WgMain
